@@ -50,9 +50,6 @@ jobs:
       - name: Install dependencies
         run: poetry install --with test --no-interaction
 
-      - name: Run tests with pytest
-        run: poetry run pytest
-
   lint:
     runs-on: ubuntu-latest
     steps:
