@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "actio"
+version = "0.0.1"
+description = "Pure Python actor system for building concurrent and distributed applications with async/await support for Python 3.11+"
+authors = ["Semenets V. Pavel <p.semenets@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+packages = [{ include = "actio", from = "src" }]
+homepage = "https://github.com/xDarkmanx/actio"
+repository = "https://github.com/xDarkmanx/actio"
+documentation = "https://github.com/xDarkmanx/actio#readme"
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Hardware",
+    "Topic :: Communications",
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
