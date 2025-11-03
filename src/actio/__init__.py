@@ -15,7 +15,7 @@ from .registry import ActorRegistry
 from .registry import registry
 from .registry import actio
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 __author__ = "Semenets V. Pavel"
 __license__ = "MIT"
 
