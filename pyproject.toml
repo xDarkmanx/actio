@@ -28,6 +28,25 @@ classifiers = [
 [tool.poetry.dependencies]
 python = ">=3.11"
 
+[tool.poetry.group.lint.dependencies]
+flake8 = "^7.3.0"
+
+[tool.poetry.group.security.dependencies]
+bandit = "^1.8.6"
+
+[tool.poetry.group.test.dependencies]
+pytest = ">=8.4.2"
+pytest-asyncio = ">=1.2.0"
+pytest-cov = ">=4.1.0"
+pytest-mock = ">=3.11.0"
+anyio = ">=3.7.0"
+
+[tool.flake8]
+max-line-length = 127
+max-complexity = 25
+ignore = "E203,W503"
+exclude = [".git", "__pycache__", ".venv", "build", "dist"]
+
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"

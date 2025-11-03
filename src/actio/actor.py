@@ -1,4 +1,4 @@
-# api/common/akka/Akka.py
+# actio/actor.py
 # -*- coding: utf-8 -*-
 
 from typing import Union
@@ -183,7 +183,10 @@ class Actor:
             current_source = forwarded_message.get('source', '')
             # forwarded_message['source'] = f"{self.actor_ref.name}/{current_source}".strip('/')
 
-            log.debug(f"[{self.actor_ref.path}] Routing to child '{first_part}' with new destination '{remaining_path}' and updated source '{forwarded_message['source']}'.")
+            log.debug(
+                f"[{self.actor_ref.path}] Routing to child '{first_part}' "
+                f"with new destination '{remaining_path}' and updated source "
+                f"'{forwarded_message['source']}'.")
             self.tell(target_child_ref, forwarded_message)
         else:
             # Не нашли потомка, пересылаем родителю.
@@ -194,15 +197,20 @@ class Actor:
                 current_source = forwarded_message.get('source', '')
                 forwarded_message['source'] = f"{self.actor_ref.name}/{current_source}".strip('/')
 
-                log.debug(f"[{self.actor_ref.path}] Forwarding to parent with updated source '{forwarded_message['source']}'.")
+                log.debug(
+                    f"[{self.actor_ref.path}] Forwarding to parent with "
+                    f"updated source '{forwarded_message['source']}'.")
                 self.tell(self.parent, forwarded_message)
             else:
                 # Мы корневой актор и не можем маршрутизировать дальше
-                log.warning(f"[{self.actor_ref.path}] Cannot route message, no parent and '{first_part}' not found among children. Message: {message}")
+                log.warning(
+                    f"[{self.actor_ref.path}] Cannot route message, "
+                    f"no parent and '{first_part}' not found among children. Message: {message}"
+                )
                 # Можно отправить DeadLetter отправителю или в специальный актор
                 # self.tell(sender, DeadLetter(...))
 
-        return True # Сообщение было обработано как маршрутное
+        return True  # Сообщение было обработано как маршрутное
 
 
 class ActorSystem:
@@ -211,7 +219,7 @@ class ActorSystem:
     def __init__(self):
         self._actors: Dict[ActorRef, '_ActorContext'] = {}
         self._is_stopped = asyncio.Event()
-        self.children: List[ActorRef] = [] # Корневые акторы
+        self.children: List[ActorRef] = []  # Корневые акторы
 
     def create(self, actor: Actor, name: Optional[str] = None) -> ActorRef:
         """Создаёт корневой актор."""
@@ -339,7 +347,7 @@ class ActorSystem:
         delay = (ts - asyncio.get_event_loop().time()) if ts else 0
         while True:
             if delay > 0:
-                await  asyncio.sleep(delay)
+                await asyncio.sleep(delay)
 
             self._tell(actor=actor, message=message, sender=sender)
             if not period:
@@ -391,7 +399,12 @@ class ActorSystem:
             for actor_ref in self.children:  # children propagate stop messages
                 self.stop(actor_ref)
 
-            lifecycle_tasks = [task for task in (actor_ctx.lifecycle for actor_ctx in self._actors.values()) if task is not None]
+            lifecycle_tasks = [
+                task for task
+                in (actor_ctx.lifecycle for actor_ctx in self._actors.values())
+                if task is not None
+            ]
+
             done, pending = await asyncio.wait(lifecycle_tasks, timeout=timeout)
             for lifecycle_task in pending:
                 lifecycle_task.cancel()

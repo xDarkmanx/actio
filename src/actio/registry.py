@@ -21,12 +21,14 @@ class ActorRegistry:
     def __init__(self):
         self._definitions: Dict[str, ActorDefinition] = {}
 
-    def actio(self,
+    def actio(
+        self,
         name: Optional[str] = None,
         parent: Optional[str] = None,
         replicas: int = 1,
         minimal: int = 1,
-        config: Optional[Dict[str, Any]] = None):
+        config: Optional[Dict[str, Any]] = None
+    ):
 
         def decorator(cls):
             actor_name = name or cls.__name__
@@ -41,7 +43,12 @@ class ActorRegistry:
             return cls
         return decorator
 
-    async def build_actor_tree(self, system: ActorSystem, root_name: str = 'MainTasks', timeout: float = 5.0) -> Dict[str, ActorRef]:
+    async def build_actor_tree(
+        self,
+        system: ActorSystem,
+        root_name: str = 'MainTasks',
+        timeout: float = 5.0
+    ) -> Dict[str, ActorRef]:
         refs = {}
         actor_instances = {}
 
@@ -75,7 +82,11 @@ class ActorRegistry:
         while asyncio.get_event_loop().time() - start_time < timeout:
             all_started = True
             for actor_instance in actor_instances.values():
-                if hasattr(actor_instance, '_context') and actor_instance._context and not actor_instance._context.receiving_messages:
+                if (
+                    hasattr(actor_instance, '_context')
+                    and actor_instance._context
+                    and not actor_instance._context.receiving_messages
+                ):
                     all_started = False
                     break
 

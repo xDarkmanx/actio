@@ -8,6 +8,7 @@ from typing import Optional
 from dataclasses import dataclass
 from dataclasses import field
 
+
 @dataclass(repr=False, eq=False, frozen=True)
 class ActorRef:
     actor_id: str
@@ -17,7 +18,6 @@ class ActorRef:
     def __str__(self):
         return self.path
 
-
     def __hash__(self):
         return hash(self.actor_id)
 
@@ -26,6 +26,7 @@ class ActorRef:
 
     def __eq__(self, other):
         return isinstance(other, ActorRef) and self.actor_id == other.actor_id
+
 
 @dataclass
 class ActorDefinition:
