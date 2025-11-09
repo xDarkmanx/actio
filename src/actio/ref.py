@@ -35,4 +35,5 @@ class ActorDefinition:
     parent: Optional[str]
     replicas: int = 1
     minimal: int = 1
+    dynamic: bool = False
     config: Dict[str, Any] = field(default_factory=dict)

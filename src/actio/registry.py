@@ -20,6 +20,7 @@ log = logging.getLogger('actio.registry')
 class ActorRegistry:
     def __init__(self):
         self._definitions: Dict[str, ActorDefinition] = {}
+        self._dynamic_definitions: Dict[str, ActorDefinition] = {}
 
     def actio(
         self,
@@ -27,26 +28,33 @@ class ActorRegistry:
         parent: Optional[str] = None,
         replicas: int = 1,
         minimal: int = 1,
+        dynamic: bool = False,
         config: Optional[Dict[str, Any]] = None
     ):
 
         def decorator(cls):
             actor_name = name or cls.__name__
-            self._definitions[actor_name] = ActorDefinition(
+            definition = ActorDefinition(
                 name=actor_name,
                 cls=cls,
                 parent=parent,
                 replicas=replicas,
                 minimal=minimal,
+                dynamic=dynamic,
                 config=config or {}
             )
+
+            if dynamic:
+                self._dynamic_definitions[actor_name] = definition
+            else:
+                self._definitions[actor_name] = definition
+
             return cls
         return decorator
 
     async def build_actor_tree(
         self,
         system: ActorSystem,
-        root_name: str = 'MainTasks',
         timeout: float = 5.0
     ) -> Dict[str, ActorRef]:
         refs = {}
@@ -98,7 +106,13 @@ class ActorRegistry:
 
     def get_actor_graph(self) -> Dict[Optional[str], List[str]]:
         graph = {}
+
         for defn in self._definitions.values():
+            if defn.parent not in graph:
+                graph[defn.parent] = []
+            graph[defn.parent].append(defn.name)
+
+        for defn in self._dynamic_definitions.values():
             if defn.parent not in graph:
                 graph[defn.parent] = []
             graph[defn.parent].append(defn.name)
@@ -110,21 +124,24 @@ class ActorRegistry:
         graph = self.get_actor_graph()
 
         def print_node(parent: Optional[str], level: int = 0):
-            indent = "  " * level
+            indent = "│ " * level
             if parent in graph:
                 for child in graph[parent]:
-                    defn = self._definitions[child]
-                    log.warning(f"{indent}├── {child} (replicas={defn.replicas}, minimal={defn.minimal})")
-                    print_node(child, level + 1)
+                    defn = self._definitions[child] or self._dynamic_definitions.get(child)
+                    if defn:
+                        marker = " 🌀" if defn.dynamic else ""
+                        log.warning(f"{indent}├── {child}{marker} (replicas={defn.replicas}, minimal={defn.minimal})")
+                        print_node(child, level + 1)
+
             elif parent is None:
-                for root in graph[None]:
+                roots = graph.get(None, [])
+                for root in roots:
                     defn = self._definitions[root]
                     log.warning(f"┌── {root} (replicas={defn.replicas}, minimal={defn.minimal})")
                     print_node(root, 1)
 
         log.warning("Actor System Tree:")
         print_node(None)
-
 
 registry = ActorRegistry()
 actio = registry.actio
