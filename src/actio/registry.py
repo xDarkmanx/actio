@@ -11,16 +11,15 @@ from typing import List
 
 from . import ActorRef
 from . import ActorDefinition
-
-from . import ActorSystem
+# from . import ActorSystem
 
 log = logging.getLogger('actio.registry')
-
 
 class ActorRegistry:
     def __init__(self):
         self._definitions: Dict[str, ActorDefinition] = {}
         self._dynamic_definitions: Dict[str, ActorDefinition] = {}
+        self._actor_instances: Dict[str, List[ActorRef]] = {}
 
     def actio(
         self,
@@ -54,7 +53,7 @@ class ActorRegistry:
 
     async def build_actor_tree(
         self,
-        system: ActorSystem,
+        system: 'ActorSystem',
         timeout: float = 5.0
     ) -> Dict[str, ActorRef]:
         refs = {}
@@ -104,14 +103,22 @@ class ActorRegistry:
 
         return refs
 
+    def register_instance(self, template_name: str, actor_ref: ActorRef):
+        """Регистрируем созданный экземпляр динамического актора"""
+        if template_name not in self._actor_instances:
+            self._actor_instances[template_name] = []
+        self._actor_instances[template_name].append(actor_ref)
+
     def get_actor_graph(self) -> Dict[Optional[str], List[str]]:
         graph = {}
 
+        # Статические акторы
         for defn in self._definitions.values():
             if defn.parent not in graph:
                 graph[defn.parent] = []
             graph[defn.parent].append(defn.name)
 
+        # Динамические шаблоны
         for defn in self._dynamic_definitions.values():
             if defn.parent not in graph:
                 graph[defn.parent] = []
@@ -122,26 +129,34 @@ class ActorRegistry:
     def print_actor_tree(self):
         """Печатает дерево акторов в консоль"""
         graph = self.get_actor_graph()
+        instances = self.get_dynamic_instances()
 
         def print_node(parent: Optional[str], level: int = 0):
-            indent = "│ " * level
+            indent = "│   " * level
             if parent in graph:
                 for child in graph[parent]:
-                    defn = self._definitions[child] or self._dynamic_definitions.get(child)
+                    defn = self._definitions.get(child) or self._dynamic_definitions.get(child)
                     if defn:
-                        marker = " 🌀" if defn.dynamic else ""
-                        log.warning(f"{indent}├── {child}{marker} (replicas={defn.replicas}, minimal={defn.minimal})")
-                        print_node(child, level + 1)
+                        marker = " 🎯" if defn.dynamic else " ♻️"
+                        # Печатаем шаблон
+                        log.warning(f"{indent}├── {child}{marker}")
 
-            elif parent is None:
-                roots = graph.get(None, [])
-                for root in roots:
-                    defn = self._definitions[root]
-                    log.warning(f"┌── {root} (replicas={defn.replicas}, minimal={defn.minimal})")
-                    print_node(root, 1)
+                        # Если это динамический шаблон - печатаем экземпляры
+                        if defn.dynamic and child in instances:
+                            for instance in instances[child]:
+                                log.warning(f"{indent}│   ├── {instance} 🌀")
+
+                        print_node(child, level + 1)
 
         log.warning("Actor System Tree:")
         print_node(None)
+
+    def get_dynamic_instances(self) -> Dict[str, List[str]]:
+        """Возвращает template_name -> list(instance_names)"""
+        instances = {}
+        for template_name, actor_refs in self._actor_instances.items():
+            instances[template_name] = [ref.name for ref in actor_refs]
+        return instances
 
 registry = ActorRegistry()
 actio = registry.actio

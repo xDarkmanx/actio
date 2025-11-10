@@ -16,7 +16,6 @@ from uuid import uuid4
 from . import PoisonPill
 from . import DeadLetter
 from . import Terminated
-
 from . import ActorRef
 
 log = logging.getLogger('actio.actor')
@@ -34,13 +33,34 @@ class Actor:
         """
         raise NotImplementedError
 
-    # --- Вспомогательные методы для работы с детьми и системой ---
-
     def create(self, actor: 'Actor', name: Optional[str] = None) -> ActorRef:
         """Создаёт дочерний актор."""
+        # УСТАНАВЛИВАЕМ _definition ПЕРЕД созданием
+        self._set_actor_definition(actor)
+
         child_actor_ref = self.system._create(actor=actor, parent=self.actor_ref, name=name)
         self.watch(child_actor_ref)
         return child_actor_ref
+
+    def _set_actor_definition(self, actor: 'Actor'):
+        """Устанавливает _definition для актора из registry."""
+        try:
+            from . import registry
+            actor_class = type(actor)
+
+            # Ищем определение в registry
+            for defn in registry._definitions.values():
+                if defn.cls == actor_class:
+                    actor._definition = defn
+                    return
+            for defn in registry._dynamic_definitions.values():
+                if defn.cls == actor_class:
+                    actor._definition = defn
+                    return
+
+            log.debug(f"No definition found for actor class: {actor_class.__name__}")
+        except ImportError:
+            log.debug("Registry not available for setting actor definition")
 
     def tell(self, actor: Union['Actor', ActorRef], message: Any) -> None:
         """Отправляет сообщение другому актору."""
@@ -140,10 +160,7 @@ class Actor:
 
         # 1. Если destination пустой, это сообщение для текущего актора
         if not destination:
-            # Передаём данные для обработки
-            # Создаём новое сообщение, чтобы не мутировать оригинальное
             final_message = data if isinstance(data, dict) else {'data': data}
-            # Добавляем информацию о маршруте в финальное сообщение, если нужно
             final_message['source'] = message.get('source')
             await self.receive(sender, final_message)
             return True
@@ -151,7 +168,6 @@ class Actor:
         # 2. Разбираем путь
         path_parts = [p for p in destination.split('/') if p]
         if not path_parts:
-            # destination был "/", что тоже означает "этот актор"
             final_message = data if isinstance(data, dict) else {'data': data}
             await self.receive(sender, final_message)
             return True
@@ -159,15 +175,12 @@ class Actor:
         first_part = path_parts[0]
         remaining_path = "/".join(path_parts[1:]) if len(path_parts) > 1 else None
 
-        # 3. Проверяем, является ли первая часть именем нашего прямого потомка
-        # Предполагаем, что у актора есть словарь потомков self.actors (как в примерах)
-        # Если такого атрибута нет, ищем в _context.children
+        # 3. Ищем ребенка
         target_child_ref: Optional[ActorRef] = None
         child_actors_dict = getattr(self, 'actors', None)
         if child_actors_dict and isinstance(child_actors_dict, dict):
             target_child_ref = child_actors_dict.get(first_part)
         else:
-            # Поиск по имени в списке детей из контекста
             assert self._context is not None, "Actor context not initialized"
             for child_ref in self._context.children:
                 if child_ref.name == first_part:
@@ -175,42 +188,34 @@ class Actor:
                     break
 
         if target_child_ref:
-            # Нашли потомка, пересылаем ему.
-            # Формируем новое сообщение с обновлённым destination
+            # Нашли потомка - пересылаем ему
             forwarded_message = message.copy()
             forwarded_message['destination'] = remaining_path
-            # Обновляем source: добавляем себя
             current_source = forwarded_message.get('source', '')
-            # forwarded_message['source'] = f"{self.actor_ref.name}/{current_source}".strip('/')
 
             log.debug(
                 f"[{self.actor_ref.path}] Routing to child '{first_part}' "
-                f"with new destination '{remaining_path}' and updated source "
-                f"'{forwarded_message['source']}'.")
+                f"with new destination '{remaining_path}'"
+            )
             self.tell(target_child_ref, forwarded_message)
         else:
-            # Не нашли потомка, пересылаем родителю.
+            # Не нашли - пересылаем родителю
             if self.parent:
-                # Формируем новое сообщение с обновлённым source
                 forwarded_message = message.copy()
-                # Обновляем source: добавляем себя
                 current_source = forwarded_message.get('source', '')
                 forwarded_message['source'] = f"{self.actor_ref.name}/{current_source}".strip('/')
 
                 log.debug(
-                    f"[{self.actor_ref.path}] Forwarding to parent with "
-                    f"updated source '{forwarded_message['source']}'.")
+                    f"[{self.actor_ref.path}] Forwarding to parent"
+                )
                 self.tell(self.parent, forwarded_message)
             else:
-                # Мы корневой актор и не можем маршрутизировать дальше
                 log.warning(
                     f"[{self.actor_ref.path}] Cannot route message, "
-                    f"no parent and '{first_part}' not found among children. Message: {message}"
+                    f"no parent and '{first_part}' not found among children"
                 )
-                # Можно отправить DeadLetter отправителю или в специальный актор
-                # self.tell(sender, DeadLetter(...))
 
-        return True  # Сообщение было обработано как маршрутное
+        return True
 
 
 class ActorSystem:
@@ -219,7 +224,7 @@ class ActorSystem:
     def __init__(self):
         self._actors: Dict[ActorRef, '_ActorContext'] = {}
         self._is_stopped = asyncio.Event()
-        self.children: List[ActorRef] = []  # Корневые акторы
+        self.children: List[ActorRef] = []
 
     def create(self, actor: Actor, name: Optional[str] = None) -> ActorRef:
         """Создаёт корневой актор."""
@@ -287,9 +292,16 @@ class ActorSystem:
 
         if parent and parent_ctx:
             parent_ctx.children.append(actor_ref)
-
         else:
             self.children.append(actor_ref)
+
+        if hasattr(actor, '_definition') and getattr(actor._definition, 'dynamic', False):
+            try:
+                from . import registry
+                registry.register_instance(actor._definition.name, actor_ref)
+
+            except ImportError as e:
+                log.error(f"Failed to register dynamic instance: {e}")
 
         return actor_ref
 
@@ -299,18 +311,15 @@ class ActorSystem:
 
         if sender:
             sender = self._validate_actor_ref(sender)
-
             if sender not in self._actors:
                 raise ValueError(f'Sender does not exist: {sender}')
 
         if actor in self._actors:
             actor_ctx = self._actors[actor]
             actor_ctx.letterbox.put_nowait((sender, message))
-
         elif sender:
             deadletter = DeadLetter(actor=actor, message=message)
             self._tell(sender, deadletter, sender=None)
-
         else:
             log.warning(f'Failed to deliver message {message} to {actor}')
 
@@ -331,7 +340,9 @@ class ActorSystem:
             delay = period
 
         ts = asyncio.get_event_loop().time() + delay
-        return asyncio.create_task(self._schedule_tell_loop(actor=actor, message=message, sender=sender, ts=ts, period=period))
+        return asyncio.create_task(self._schedule_tell_loop(
+            actor=actor, message=message, sender=sender, ts=ts, period=period
+        ))
 
     async def _schedule_tell_loop(
             self,
@@ -352,13 +363,11 @@ class ActorSystem:
             self._tell(actor=actor, message=message, sender=sender)
             if not period:
                 break
-
             delay = period
 
     def _watch(self, actor: Union[Actor, ActorRef], other: Union[Actor, ActorRef]) -> None:
         """Внутренний метод для наблюдения за актором."""
         actor = self._validate_actor_ref(actor)
-
         if actor not in self._actors:
             raise ValueError(f'Actor does not exist: {actor}')
 
@@ -396,7 +405,7 @@ class ActorSystem:
     async def _shutdown(self, timeout: Union[None, int, float] = None) -> None:
         """Внутренний метод завершения работы системы."""
         if self._actors:
-            for actor_ref in self.children:  # children propagate stop messages
+            for actor_ref in self.children:
                 self.stop(actor_ref)
 
             lifecycle_tasks = [
@@ -416,7 +425,6 @@ class ActorSystem:
         try:
             await actor.started()
             actor_ctx.receiving_messages = True
-
         except Exception as e:
             log.exception('Exception raised while awaiting start of %s', actor_ref, exc_info=e)
 
@@ -425,24 +433,15 @@ class ActorSystem:
             if isinstance(message, PoisonPill):
                 break
 
-            # --- Логика маршрутизации ---
-            # Проверяем, является ли сообщение маршрутизируемым.
-            # Это делается до вызова пользовательского `receive`.
+            # Логика маршрутизации
             message_handled_by_routing = False
             if isinstance(message, dict) and message.get('action') == 'route_message':
                 try:
-                    # Даем актору возможность обработать маршрутизацию самостоятельно
-                    # (например, если у него своя логика для 'route_message')
-                    # Если метод _route_message_logic возвращает True, значит он обработал.
-                    # Мы предполагаем, что базовый Actor имеет этот метод.
-
                     if hasattr(actor, '_route_message_logic'):
-                        # Вызываем напрямую, так как это вспомогательный метод
                         message_handled_by_routing = await actor._route_message_logic(sender, message)
                 except Exception as e:
                     log.error(f"Error in _route_message_logic for {actor_ref.path}: {e}")
 
-            # Если маршрутизация не обработала сообщение, передаём его в receive актора
             if not message_handled_by_routing:
                 try:
                     await actor.receive(sender, message)
@@ -451,10 +450,10 @@ class ActorSystem:
                         await actor.restarted(sender, message, e)
                     except Exception as e:
                         log.exception(f'Exception raised while awaiting restart of {actor_ref}', exc_info=e)
-            # --- Конец логики маршрутизации ---
 
         actor_ctx.receiving_messages = False
 
+        # Остановка детей
         children_stopping = []
         for child in actor_ctx.children:
             child_ctx = self._actors[child]
@@ -466,10 +465,10 @@ class ActorSystem:
 
         try:
             await actor.stopped()
-
         except Exception as e:
             log.exception(f'Exception raised while awaiting stop of {actor_ref}', exc_info=e)
 
+        # Уведомление наблюдателей
         for other in actor_ctx.watched_by:
             self._tell(other, Terminated(actor_ref), sender=None)
             other_ctx = self._actors[other]
@@ -479,12 +478,14 @@ class ActorSystem:
             other_ctx = self._actors[other]
             other_ctx.watched_by.remove(actor_ref)
 
+        # Удаление из родителя
         if actor_ctx.parent:
             parent_ctx = self._actors[actor_ctx.parent]
             parent_ctx.children.remove(actor_ref)
         else:
             self.children.remove(actor_ref)
 
+        # Очистка очереди
         while not actor_ctx.letterbox.empty():
             sender, message = actor_ctx.letterbox.get_nowait()
             if sender and sender != actor_ref:

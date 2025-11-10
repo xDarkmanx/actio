@@ -8,12 +8,12 @@ from .messages import PoisonPill
 from .messages import DeadLetter
 from .messages import Terminated
 
-from .actor import Actor
-from .actor import ActorSystem
-
 from .registry import ActorRegistry
 from .registry import registry
 from .registry import actio
+
+from .actor import Actor
+from .actor import ActorSystem
 
 __version__ = "0.0.3"
 __author__ = "Semenets V. Pavel"
@@ -29,12 +29,12 @@ __all__ = [
     'DeadLetter',
     'Terminated',
 
-    # from actor.py
-    'Actor',
-    'ActorSystem',
-
     # from registry.py
     'ActorRegistry',
     'registry',
-    'actio'
+    'actio',
+
+    # from actor.py
+    'Actor',
+    'ActorSystem'
 ]
