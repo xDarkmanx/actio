@@ -53,6 +53,7 @@ class Actor:
                 if defn.cls == actor_class:
                     actor._definition = defn
                     return
+
             for defn in registry._dynamic_definitions.values():
                 if defn.cls == actor_class:
                     actor._definition = defn
@@ -65,23 +66,6 @@ class Actor:
     def tell(self, actor: Union['Actor', ActorRef], message: Any) -> None:
         """Отправляет сообщение другому актору."""
         self.system._tell(actor=actor, message=message, sender=self.actor_ref)
-
-    def schedule_tell(
-        self,
-        actor: Union['Actor', ActorRef],
-        message: Any,
-        *,
-        delay: Union[None, int, float] = None,
-        period: Union[None, int, float] = None,
-    ) -> asyncio.Task:
-        """Отправляет сообщение с задержкой или периодически."""
-        return self.system._schedule_tell(
-            actor=actor,
-            message=message,
-            sender=self.actor_ref,
-            delay=delay,
-            period=period
-        )
 
     def watch(self, actor: ActorRef) -> None:
         """Наблюдает за другим актором."""
@@ -141,8 +125,8 @@ class Actor:
     def __repr__(self):
         return self.path
 
-    # --- Вспомогательные методы для маршрутизации ---
 
+    # --- Вспомогательные методы для маршрутизации ---
     async def _route_message_logic(self, sender: ActorRef, message: Dict[str, Any]) -> bool:
         """
         Встроенная логика маршрутизации для сообщений с действием 'route_message'.
@@ -234,17 +218,6 @@ class ActorSystem:
         """Отправляет сообщение актору."""
         self._tell(actor=actor, message=message, sender=None)
 
-    def schedule_tell(
-        self,
-        actor: Union[Actor, ActorRef],
-        message: Any,
-        *,
-        delay: Union[None, int, float] = None,
-        period: Union[None, int, float] = None
-    ) -> asyncio.Task:
-        """Отправляет сообщение с задержкой или периодически."""
-        return self._schedule_tell(actor=actor, message=message, sender=None, delay=delay, period=period)
-
     def stop(self, actor: Union[Actor, ActorRef]) -> None:
         """Останавливает актор."""
         self._tell(actor=actor, message=PoisonPill(), sender=None)
@@ -322,48 +295,6 @@ class ActorSystem:
             self._tell(sender, deadletter, sender=None)
         else:
             log.warning(f'Failed to deliver message {message} to {actor}')
-
-    def _schedule_tell(
-        self,
-        actor: Union[Actor, ActorRef],
-        message: Any,
-        *,
-        sender: Union[None, Actor, ActorRef],
-        delay: Union[None, int, float] = None,
-        period: Union[None, int, float] = None
-    ) -> asyncio.Task:
-        """Внутренний метод планирования отправки сообщения."""
-        if not delay:
-            if not period:
-                raise ValueError('Cannot schedule message without delay and period')
-            self._tell(actor=actor, message=message, sender=sender)
-            delay = period
-
-        ts = asyncio.get_event_loop().time() + delay
-        return asyncio.create_task(self._schedule_tell_loop(
-            actor=actor, message=message, sender=sender, ts=ts, period=period
-        ))
-
-    async def _schedule_tell_loop(
-            self,
-            actor: Union[Actor, ActorRef],
-            message: Any,
-            *,
-            sender: Union[None, Actor, ActorRef],
-            ts: Union[None, int, float] = None,
-            period: Union[None, int, float] = None
-    ) -> None:
-        """Цикл для периодической отправки сообщения."""
-        actor = self._validate_actor_ref(actor)
-        delay = (ts - asyncio.get_event_loop().time()) if ts else 0
-        while True:
-            if delay > 0:
-                await asyncio.sleep(delay)
-
-            self._tell(actor=actor, message=message, sender=sender)
-            if not period:
-                break
-            delay = period
 
     def _watch(self, actor: Union[Actor, ActorRef], other: Union[Actor, ActorRef]) -> None:
         """Внутренний метод для наблюдения за актором."""
