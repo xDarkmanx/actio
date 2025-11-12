@@ -1,6 +1,8 @@
 # actio/__init__.py
 # -*- coding: utf-8 -*-
 
+from .config import ActioConfig
+
 from .ref import ActorRef
 from .ref import ActorDefinition
 
@@ -14,12 +16,16 @@ from .registry import actio
 
 from .actor import Actor
 from .actor import ActorSystem
+from .cluster import ClusterActor
 
 __version__ = "0.0.3"
 __author__ = "Semenets V. Pavel"
 __license__ = "MIT"
 
 __all__ = [
+    # from config
+    'ActioConfig',
+
     # from ref.py
     'ActorRef',
     'ActorDefinition',
@@ -36,5 +42,6 @@ __all__ = [
 
     # from actor.py
     'Actor',
+    'ClusterActor',
     'ActorSystem'
 ]

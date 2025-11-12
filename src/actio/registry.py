@@ -11,7 +11,6 @@ from typing import List
 
 from . import ActorRef
 from . import ActorDefinition
-# from . import ActorSystem
 
 log = logging.getLogger('actio.registry')
 

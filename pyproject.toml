@@ -27,6 +27,7 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = ">=3.11"
+pydantic = "^2.12.4"
 
 [tool.poetry.group.lint.dependencies]
 flake8 = "^7.3.0"
