@@ -8,11 +8,16 @@ from typing import Dict
 from typing import Any
 from typing import Optional
 from typing import List
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from . import ActorSystem
 
 from . import ActorRef
 from . import ActorDefinition
 
 log = logging.getLogger('actio.registry')
+
 
 class ActorRegistry:
     def __init__(self):
@@ -207,6 +212,7 @@ class ActorRegistry:
         for template_name, actor_refs in self._actor_instances.items():
             instances[template_name] = [ref.name for ref in actor_refs]
         return instances
+
 
 registry = ActorRegistry()
 actio = registry.actio

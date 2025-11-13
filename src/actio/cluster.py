@@ -689,7 +689,6 @@ class ClusterActor(Actor):
     async def _process_leader_announcement(self, message: Dict[str, Any]):
         """Обрабатывает анонс лидерства от другой ноды"""
         announced_leader = message["leader_id"]
-        announcement_time = message["timestamp"]
 
         # Если объявленный лидер "меньше" текущего лидера, принимаем его
         alive_nodes = [
@@ -758,9 +757,11 @@ class ClusterActor(Actor):
                 node_host, node_port = node.split(":")
                 node_id = f"{node_host}:{node_port}"
 
-                if (node_host != self.config.node_id and
+                if (
+                    node_host != self.config.node_id and
                     node_id not in self.conn and
-                    node_id not in self.members.get("dead", [])):
+                    node_id not in self.members.get("dead", [])
+                ):
                     await self._node_conn(node_host, int(node_port))
 
             await asyncio.sleep(30)

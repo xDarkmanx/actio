@@ -125,7 +125,6 @@ class Actor:
     def __repr__(self):
         return self.path
 
-
     # --- Вспомогательные методы для маршрутизации ---
     async def _route_message_logic(self, sender: ActorRef, message: Dict[str, Any]) -> bool:
         """

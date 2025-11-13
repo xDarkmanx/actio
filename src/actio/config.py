@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*
 
 from typing import List
-from typing import Optional
 from typing import Dict
 from typing import Any
 
 from pydantic import BaseModel
 from pydantic import Field
 from pydantic import field_validator
+
 
 class ActioConfig(BaseModel):
     node_id: str = Field(..., description="Unique node ID")
