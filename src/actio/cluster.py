@@ -202,6 +202,131 @@ class ClusterActor(Actor):
         self._cluster_initialized = True
         log.info(f"✅ Cluster node {self.config.node_id} fully initialized")
 
+    async def _route_message_logic(self, sender: ActorRef, message: Dict[str, Any]) -> bool:
+        """
+            Полная межвидовая маршрутизация:
+            1. Только route_message
+            2. node: → межнодовая пересылка
+            3. Локальный поиск → MPLS
+            4. Не найден локально → поиск в кластере
+        """
+        action = message.get('action')
+        if action != 'route_message':
+            return False
+
+        destination = message.get('destination', '')
+
+        if destination.startswith('node:'):
+            await self._cluster_route(destination[5:], message, sender)
+            return True
+
+        handled_locally = await super()._route_message_logic(sender, message)
+        if handled_locally:
+            return True
+
+        return await self._try_cluster_routing(message, sender)
+
+    async def _try_cluster_routing(self, message: Dict[str, Any], sender: ActorRef) -> bool:
+        if not self._cluster_initialized:
+            return False
+
+        destination = message.get('destination', '')
+        if not destination:
+            return False
+
+        target_ref = await self._find_actor_in_cluster(destination)
+        if not target_ref:
+            return False  # Не нашли в кластере
+
+        current_source = message.get('source', '')
+        new_source = f"node:{self.config.node_id}/{current_source}" if current_source else f"node:{self.config.node_id}"
+
+        forward_message = message.copy()
+        forward_message['source'] = new_source
+
+        await self._forward_to_cluster_node(target_ref.node_id, forward_message, sender)
+        return True
+
+    async def _find_actor_in_cluster(self, actor_path: str) -> Optional[ActorRef]:
+        """Ищет актор в кластере через registry"""
+        replicas = registry.get_actor_replicas(actor_path)
+        if replicas:
+            # Возвращаем первую доступную реплику
+            return next(iter(replicas.values()))
+        return None
+
+    async def _cluster_route(self, node_and_path: str, message: Dict[str, Any], sender: ActorRef) -> bool:
+        """
+        Разбирает node:api1/Sio/KsNs и пересылает на нужную ноду
+        """
+        try:
+            # Парсим "api1/Sio/KsNs" → node_id='api1', path='Sio/KsNs'
+            parts = node_and_path.split('/', 1)
+            target_node = parts[0]
+            remaining_path = parts[1] if len(parts) > 1 else None
+
+            # Формируем сообщение для пересылки
+            forward_message = message.copy()
+            if remaining_path:
+                forward_message['destination'] = remaining_path
+            else:
+                forward_message['destination'] = ''  # Сообщение для корня ноды
+
+            # Пересылаем на целевую ноду
+            await self._forward_to_cluster_node(target_node, forward_message, sender)
+            return True
+
+        except Exception as e:
+            log.error(f"Cluster routing error for {node_and_path}: {e}")
+            return False
+
+    async def _forward_to_cluster_node(self, node_id: str, message: Dict[str, Any], sender: ActorRef):
+        """
+        Просто отправляем route_message на другую ноду, добавляя node: в source
+        """
+        if not self._cluster_initialized:
+            log.warning(f"Cluster not ready, cannot forward to {node_id}")
+            return
+
+        # Создаём копию с обновлённым source
+        forwarded_message = message.copy()
+        current_source = message.get('source', '')
+
+        if current_source:
+            forwarded_message['source'] = f"node:{self.config.node_id}/{current_source}"
+        else:
+            forwarded_message['source'] = f"node:{self.config.node_id}"
+
+        # ПРОСТО ОТПРАВЛЯЕМ route_message как есть!
+        connection_id = self._find_connection_for_node(node_id)
+        if connection_id:
+            await self._send_msg(connection_id, forwarded_message)
+            log.debug(f"📡 Forwarded to {node_id}: {message.get('destination')}")
+        else:
+            log.warning(f"🚫 No connection to node {node_id}")
+
+    def _find_connection_for_node(self, node_id: str) -> Optional[str]:
+        """
+        Находит connection_id для node_id (из твоего кода ранее)
+        """
+        # Прямое совпадение
+        if node_id in self.conn:
+            return node_id
+
+        # Ищем по имени ноды в соединениях
+        for conn_id in self.conn.keys():
+            if node_id in conn_id:
+                return conn_id
+
+        # Ищем по адресу в members
+        if node_id in self.members:
+            member_address = self.members[node_id].get('address', '')
+            for conn_id in self.conn.keys():
+                if member_address and conn_id in member_address:
+                    return conn_id
+
+        return None
+
     async def _leader_election_loop(self):
         """Цикл выборов лидера"""
         while True:
@@ -325,26 +450,6 @@ class ClusterActor(Actor):
             log.info(f"Sent {commands_sent} create commands for {defn.name}")
         else:
             log.info(f"No create commands needed for {defn.name} - all target nodes have replicas")
-
-    def _find_connection_for_node(self, node_id: str) -> Optional[str]:
-        """Находит connection_id для node_id"""
-        # Прямое совпадение
-        if node_id in self.conn:
-            return node_id
-
-        # Ищем по имени ноды в соединениях
-        for conn_id in self.conn.keys():
-            if node_id in conn_id:
-                return conn_id
-
-        # Ищем по адресу в members
-        if node_id in self.members:
-            member_address = self.members[node_id].get('address', '')
-            for conn_id in self.conn.keys():
-                if member_address and conn_id in member_address:
-                    return conn_id
-
-        return None
 
     async def _send_replica_command(self, node_id: str, actor_name: str, action: str):
         """Отправляет команду реплики ноде"""
@@ -636,6 +741,10 @@ class ClusterActor(Actor):
         elif msg_type == "heartbeat":
             if message["node_id"] in self.members:
                 self.members[message["node_id"]]["last_seen"] = time.time()
+        else:
+            if message.get('action') == 'route_message':
+                self._context.letterbox.put_nowait((self.actor_ref, message))
+                log.debug(f"Injected route_message into letterbox for {self.actor_ref.path}")
 
     async def _process_replica_update(self, message: Dict[str, Any]):
         """Обрабатывает обновления реплик от других нод"""

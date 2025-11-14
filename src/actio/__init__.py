@@ -42,6 +42,8 @@ __all__ = [
 
     # from actor.py
     'Actor',
-    'ClusterActor',
-    'ActorSystem'
+    'ActorSystem',
+
+    # from cluster.py
+    'ClusterActor'
 ]
