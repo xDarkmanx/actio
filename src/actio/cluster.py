@@ -13,6 +13,7 @@ from typing import Dict
 from typing import Set
 from typing import Optional
 from typing import List
+from typing import Tuple
 
 from actio import Terminated
 
@@ -49,6 +50,24 @@ class CrushMapper:
 
         return max(current_weight, 0.1)
 
+    def map_actors_to_nodes(self, actor_definitions: List[ActorDefinition]) -> Dict[str, List[Tuple[str, int]]]:
+        """Распределяет акторы по нодам: {node_id: [(actor_name, replica_index)]}"""
+        if not self.nodes:
+            return {}
+
+        placement = {}
+
+        for defn in actor_definitions:
+            # Получаем целевые ноды для этого актора
+            target_nodes = self.map_actor(defn.name, defn.replicas)
+
+            for replica_index, node_id in enumerate(target_nodes):
+                if node_id not in placement:
+                    placement[node_id] = []
+                placement[node_id].append((defn.name, replica_index))
+
+        return placement
+
     def map_actor(self, actor_name: str, replicas: int = 1) -> List[str]:
         """Распределяет реплики актора по нодам с учетом существующих реплик"""
         if not self.nodes:
@@ -65,6 +84,15 @@ class CrushMapper:
 
         if not available_nodes:
             return []
+
+        # 🔧 ФИКС: Для single-replica акторов используем round-robin распределение
+        if replicas == 1 and not nodes_with_replicas:
+            available_nodes.sort()  # Для детерминированности
+            actor_hash = hash(actor_name) % len(available_nodes)
+            selected_node = available_nodes[actor_hash]
+
+            log.info(f"🎯 CrushMapper round-robin mapped {actor_name} to node: {selected_node} (from available: {available_nodes})")
+            return [selected_node]
 
         actor_hash = int(hashlib.md5(actor_name.encode()).hexdigest()[:8], 16)
         placement = []
@@ -128,6 +156,7 @@ class ClusterActor(Actor):
         self._election_task = None
         self._orchestration_task = None
         self._last_leader_announcement = 0
+        self._orchestration_done = False
 
     async def started(self) -> None:
         """Переопределяем started для правильной инициализации"""
@@ -159,7 +188,8 @@ class ClusterActor(Actor):
         log.info(f"ClusterActor started for node: {self.config.node_id}")
 
         # Регистрируем себя в реестре
-        registry._register_replica(self.__class__.__name__, self.config.node_id, self.actor_ref)
+        actor_name = self.actor_ref.name.split('-')[0]
+        registry._register_replica(actor_name, self.config.node_id, self.actor_ref)
         log.debug(f"Registered ClusterActor in registry: {self.actor_ref}")
 
         # Запускаем кластер
@@ -203,128 +233,202 @@ class ClusterActor(Actor):
         log.info(f"✅ Cluster node {self.config.node_id} fully initialized")
 
     async def _route_message_logic(self, sender: ActorRef, message: Dict[str, Any]) -> bool:
-        """
-            Полная межвидовая маршрутизация:
-            1. Только route_message
-            2. node: → межнодовая пересылка
-            3. Локальный поиск → MPLS
-            4. Не найден локально → поиск в кластере
-        """
+        """Логика маршрутизации сообщений с приоритетом кластерной маршрутизации"""
         action = message.get('action')
         if action != 'route_message':
             return False
 
         destination = message.get('destination', '')
+        log.info(f"🔍 ClusterActor routing: destination='{destination}' from {sender}")
 
+        # 1. Сначала проверяем маршрутизацию на конкретную ноду (node: префикс)
         if destination.startswith('node:'):
-            await self._cluster_route(destination[5:], message, sender)
+            log.info(f"🎯 Routing to specific node: {destination}")
+            return await self._cluster_route(destination[5:], message, sender)
+
+        # 2. Если destination пустой - это сообщение для текущего актора
+        if not destination:
+            data = message.get('data')
+            final_message = data if isinstance(data, dict) else {'data': data}
+            final_message['source'] = message.get('source')
+            log.info("📨 Processing message locally (no destination)")
+            await self.receive(sender, final_message)
             return True
 
+        # 3. Пробуем найти актор в кластере (ПЕРЕД локальной логикой!)
+        if self._cluster_initialized:
+            log.info(f"🌐 Attempting cluster routing for: {destination}")
+            cluster_handled = await self._try_cluster_routing(message, sender)
+            if cluster_handled:
+                log.info("✅ Message routed via cluster")
+                return True
+
+        # 4. Только если кластерная маршрутизация не сработала - пробуем локально
+        log.info(f"🔄 Falling back to local routing for: {destination}")
         handled_locally = await super()._route_message_logic(sender, message)
         if handled_locally:
+            log.info("✅ Message handled locally")
             return True
 
-        return await self._try_cluster_routing(message, sender)
+        # 5. Если ничего не сработало - логируем ошибку
+        log.warning(f"🚫 Message could not be routed to: {destination}")
+        return False
 
     async def _try_cluster_routing(self, message: Dict[str, Any], sender: ActorRef) -> bool:
+        """Пытается найти актор в кластере и перенаправить сообщение"""
         if not self._cluster_initialized:
+            log.debug("Cluster not initialized, skipping cluster routing")
             return False
 
         destination = message.get('destination', '')
         if not destination:
             return False
 
-        target_ref = await self._find_actor_in_cluster(destination)
+        log.info(f"🔍 Searching for actor '{destination}' in cluster registry...")
+
+        # Ищем актор в кластере через registry
+        target_ref = registry.get_any_replica(destination)
         if not target_ref:
-            return False  # Не нашли в кластере
+            log.info(f"🔍 Actor '{destination}' not found in cluster registry")
+            return False
 
-        current_source = message.get('source', '')
-        new_source = f"node:{self.config.node_id}/{current_source}" if current_source else f"node:{self.config.node_id}"
+        # Нашли актор в кластере - определяем ноду
+        log.info(f"📍 Found actor '{destination}' in cluster: {target_ref}")
 
+        # Ищем на какой ноде находится этот актор
+        target_node_id = None
+        replicas = registry.get_actor_replicas(destination)
+        for node_id, ref in replicas.items():
+            if ref == target_ref:
+                target_node_id = node_id
+                break
+
+        if not target_node_id:
+            log.warning(f"🚫 Could not determine target node for {destination}")
+            return False
+
+        # 🔥 ФИКС: Если целевая нода - это текущая нода, обрабатываем локально
+        if target_node_id == self.config.node_id:
+            log.info(f"🎯 Target is local, delivering to {destination}")
+
+            # 🔥 ВАЖНО: Не меняем сообщение, доставляем как есть!
+            # Просто передаем сообщение локальной системе маршрутизации
+            handled = await super()._route_message_logic(sender, message)
+            if handled:
+                log.info(f"✅ Local message delivered to {destination}")
+            else:
+                log.warning(f"🚫 Local message could not be delivered to {destination}")
+            return handled
+
+        log.info(f"🎯 Routing to remote node {target_node_id}")
+
+        # Формируем новое сообщение для пересылки
         forward_message = message.copy()
-        forward_message['source'] = new_source
+        current_source = message.get('source', '')
 
-        await self._forward_to_cluster_node(target_ref.node_id, forward_message, sender)
-        return True
+        # Обновляем source для отслеживания пути
+        if current_source:
+            forward_message['source'] = f"node:{self.config.node_id}/{current_source}"
+        else:
+            forward_message['source'] = f"node:{self.config.node_id}"
 
-    async def _find_actor_in_cluster(self, actor_path: str) -> Optional[ActorRef]:
-        """Ищет актор в кластере через registry"""
-        replicas = registry.get_actor_replicas(actor_path)
-        if replicas:
-            # Возвращаем первую доступную реплику
-            return next(iter(replicas.values()))
-        return None
+        # Пересылаем на целевую ноду
+        success = await self._forward_to_cluster_node(target_node_id, forward_message, sender)
+        if success:
+            log.info(f"✅ Successfully routed to node {target_node_id}")
+        else:
+            log.error(f"❌ Failed to route to node {target_node_id}")
+
+        return success
 
     async def _cluster_route(self, node_and_path: str, message: Dict[str, Any], sender: ActorRef) -> bool:
-        """
-        Разбирает node:api1/Sio/KsNs и пересылает на нужную ноду
-        """
+        """Маршрутизация на конкретную ноду в формате node:node_id/path"""
         try:
-            # Парсим "api1/Sio/KsNs" → node_id='api1', path='Sio/KsNs'
             parts = node_and_path.split('/', 1)
             target_node = parts[0]
-            remaining_path = parts[1] if len(parts) > 1 else None
+            remaining_path = parts[1] if len(parts) > 1 else ''
+
+            log.info(f"🎯 Cluster routing to node {target_node}, path: {remaining_path}")
 
             # Формируем сообщение для пересылки
             forward_message = message.copy()
-            if remaining_path:
-                forward_message['destination'] = remaining_path
-            else:
-                forward_message['destination'] = ''  # Сообщение для корня ноды
+            forward_message['destination'] = remaining_path
 
-            # Пересылаем на целевую ноду
+            current_source = message.get('source', '')
+            if current_source:
+                forward_message['source'] = f"node:{self.config.node_id}/{current_source}"
+            else:
+                forward_message['source'] = f"node:{self.config.node_id}"
+
             await self._forward_to_cluster_node(target_node, forward_message, sender)
             return True
 
         except Exception as e:
-            log.error(f"Cluster routing error for {node_and_path}: {e}")
+            log.error(f"❌ Cluster routing error for {node_and_path}: {e}")
             return False
 
-    async def _forward_to_cluster_node(self, node_id: str, message: Dict[str, Any], sender: ActorRef):
-        """
-        Просто отправляем route_message на другую ноду, добавляя node: в source
-        """
+    async def _forward_to_cluster_node(self, node_id: str, message: Dict[str, Any], sender: ActorRef) -> bool:
+        """Пересылает сообщение на указанную ноду кластера"""
         if not self._cluster_initialized:
             log.warning(f"Cluster not ready, cannot forward to {node_id}")
-            return
+            return False
 
-        # Создаём копию с обновлённым source
-        forwarded_message = message.copy()
-        current_source = message.get('source', '')
+        log.info(f"📡 Forwarding to node {node_id}: {message.get('destination', 'no destination')}")
 
-        if current_source:
-            forwarded_message['source'] = f"node:{self.config.node_id}/{current_source}"
-        else:
-            forwarded_message['source'] = f"node:{self.config.node_id}"
+        # 🔥 ФИКС: Проверяем, не пытаемся ли отправить себе
+        if node_id == self.config.node_id:
+            log.info("🎯 Message is for local node, processing locally")
+            # Доставляем сообщение локально
+            self._context.letterbox.put_nowait((sender, message))
+            return True
 
-        # ПРОСТО ОТПРАВЛЯЕМ route_message как есть!
         connection_id = self._find_connection_for_node(node_id)
         if connection_id:
-            await self._send_msg(connection_id, forwarded_message)
-            log.debug(f"📡 Forwarded to {node_id}: {message.get('destination')}")
+            try:
+                await self._send_msg(connection_id, message)
+                log.info(f"✅ Successfully forwarded to {node_id}")
+                return True
+            except Exception as e:
+                log.error(f"❌ Failed to send to {node_id}: {e}")
+                return False
         else:
             log.warning(f"🚫 No connection to node {node_id}")
 
+            # 🔥 Пробуем найти альтернативное соединение
+            for conn_id in self.conn.keys():
+                if node_id in conn_id or conn_id in node_id:
+                    try:
+                        await self._send_msg(conn_id, message)
+                        log.info(f"✅ Successfully forwarded via alternative connection {conn_id}")
+                        return True
+                    except Exception as e:
+                        log.error(f"❌ Failed to send via {conn_id}: {e}")
+
+            log.error(f"💥 No available connections to node {node_id}")
+            return False
+
     def _find_connection_for_node(self, node_id: str) -> Optional[str]:
-        """
-        Находит connection_id для node_id (из твоего кода ранее)
-        """
-        # Прямое совпадение
+        """Находит соединение для указанной ноды"""
+        # 🔥 ФИКС: Сначала проверяем точное совпадение
         if node_id in self.conn:
             return node_id
 
-        # Ищем по имени ноды в соединениях
+        # 🔥 ФИКС: Проверяем частичные совпадения (host:port форматы)
         for conn_id in self.conn.keys():
-            if node_id in conn_id:
+            # Если node_id это "api2", а conn_id это "api2:7946" - считаем что подходит
+            if node_id in conn_id or conn_id in node_id:
                 return conn_id
 
-        # Ищем по адресу в members
+        # 🔥 ФИКС: Проверяем через members информацию
         if node_id in self.members:
             member_address = self.members[node_id].get('address', '')
-            for conn_id in self.conn.keys():
-                if member_address and conn_id in member_address:
-                    return conn_id
+            if member_address:
+                # member_address в формате "api2:7946"
+                for conn_id in self.conn.keys():
+                    if member_address == conn_id or conn_id in member_address:
+                        return conn_id
 
+        log.debug(f"🔍 No connection found for node {node_id}, available: {list(self.conn.keys())}")
         return None
 
     async def _leader_election_loop(self):
@@ -332,7 +436,7 @@ class ClusterActor(Actor):
         while True:
             try:
                 await self._run_leader_election()
-                await asyncio.sleep(10)  # Проверяем каждые 10 секунд
+                await asyncio.sleep(10)
             except Exception as e:
                 log.error(f"Error in leader election: {e}")
                 await asyncio.sleep(30)
@@ -350,7 +454,6 @@ class ClusterActor(Actor):
         if not alive_nodes:
             return
 
-        # Сортируем ноды по ID (самый маленький становится лидером)
         alive_nodes.sort()
         new_leader = alive_nodes[0]
 
@@ -359,159 +462,117 @@ class ClusterActor(Actor):
 
         if self._is_leader and not was_leader:
             log.info(f"🎯 This node is now the cluster leader: {self.config.node_id}")
-            # Анонсируем лидерство
             await self._announce_leadership()
-            # Лидер запускает оркестрацию реплик
+            # Лидер запускает оркестрацию ВСЕХ static акторов
             if self._orchestration_task:
                 self._orchestration_task.cancel()
-            self._orchestration_task = asyncio.create_task(self._orchestrate_replicas_loop())
+            self._orchestration_task = asyncio.create_task(self._orchestrate_all_actors())
         elif was_leader and not self._is_leader:
             log.info(f"❌ This node is no longer the leader: {self.config.node_id}")
             if self._orchestration_task:
                 self._orchestration_task.cancel()
                 self._orchestration_task = None
 
-    async def _announce_leadership(self):
-        """Анонсирует свое лидерство кластеру"""
-        self._last_leader_announcement = time.time()
-        for node_id in self.conn:
-            await self._send_msg(
-                node_id,
-                {
-                    "type": "leader_announcement",
-                    "leader_id": self.config.node_id,
-                    "timestamp": time.time()
-                }
-            )
-
-    async def _orchestrate_replicas_loop(self):
-        """Цикл оркестрации реплик (только для лидера)"""
-        # Ждем 5 секунд чтобы убедиться что лидерство стабильно
-        await asyncio.sleep(5)
-
-        while self._is_leader:
-            try:
-                await self._orchestrate_replicas()
-                await asyncio.sleep(15)  # Оркестрируем каждые 15 секунд
-            except Exception as e:
-                log.error(f"Error in replica orchestration: {e}")
-                await asyncio.sleep(30)
-
-    async def _orchestrate_replicas(self):
-        """Лидер оркестрирует распределение реплик"""
+    async def _orchestrate_all_actors(self):
+        """Оркестрирует ВСЕ static акторы (вызывается только у лидера)"""
         if not self._is_leader:
             return
 
-        log.debug("🔄 Cluster leader orchestrating replica distribution...")
+        # Ждем стабилизации кластера
+        await asyncio.sleep(5)
 
-        for defn in registry._definitions.values():
-            if not defn.dynamic and defn.replicas > 1:
-                await self._orchestrate_static_actor_replicas(defn)
+        log.info("🔄 Leader starting orchestration of all static actors...")
 
-    async def _orchestrate_static_actor_replicas(self, defn: ActorDefinition):
-        """Лидер распределяет реплики статического актора"""
-        alive_nodes = [
-            node_id for node_id, member in self.members.items()
-            if member.get("status") == "alive"
-        ]
+        # Получаем акторы для оркестрации
+        actors_to_orchestrate = registry.get_actors_for_orchestration()
 
-        if not alive_nodes:
-            log.warning(f"No alive nodes for orchestrating {defn.name}")
+        if not actors_to_orchestrate:
+            log.info("✅ No actors to orchestrate")
+            self._orchestration_done = True
             return
 
-        # Обновляем веса нод перед распределением
+        log.info(f"🎯 Orchestrating {len(actors_to_orchestrate)} actors: {[a.name for a in actors_to_orchestrate]}")
+
+        # Обновляем веса нод
         self.crush_mapper.update_nodes(self.members)
 
-        # Получаем ТЕКУЩИЕ реплики перед распределением
-        current_replicas = registry.get_actor_replicas(defn.name)
+        # Распределяем акторы по нодам
+        placement = self.crush_mapper.map_actors_to_nodes(actors_to_orchestrate)
 
-        # Используем CrushMapper для распределения (учитывает существующие реплики)
-        target_nodes = self.crush_mapper.map_actor(defn.name, defn.replicas)
-
-        log.info(f"🎯 Orchestrating {defn.name}: target nodes {target_nodes}, current replicas {list(current_replicas.keys())}")
-        log.info(f"📡 Available connections: {list(self.conn.keys())}")
-
-        # Отправляем команды создания реплик на целевые ноды
+        # Рассылаем команды создания
         commands_sent = 0
-        for node_id in target_nodes:
-            has_replica = node_id in current_replicas
-
-            if not has_replica:
-                # Команда создать реплику
-                log.info(f"🔄 Sending CREATE command for {defn.name} to node {node_id}")
-                success = await self._send_replica_command(node_id, defn.name, "create")
+        for node_id, actor_assignments in placement.items():
+            for actor_name, replica_index in actor_assignments:
+                success = await self._send_create_command(node_id, actor_name, replica_index)
                 if success:
                     commands_sent += 1
-                    log.info(f"✅ CREATE command sent successfully to {node_id}")
-                else:
-                    log.error(f"❌ Failed to send CREATE command to {node_id}")
 
-        if commands_sent > 0:
-            log.info(f"Sent {commands_sent} create commands for {defn.name}")
-        else:
-            log.info(f"No create commands needed for {defn.name} - all target nodes have replicas")
+        log.info(f"✅ Leader sent {commands_sent} create commands")
+        self._orchestration_done = True
 
-    async def _send_replica_command(self, node_id: str, actor_name: str, action: str):
-        """Отправляет команду реплики ноде"""
-        log.info(f"🔍 Looking for connection to {node_id}")
+    async def _send_create_command(self, node_id: str, actor_name: str, replica_index: int):
+        """Отправляет команду создания актора на ноду"""
+        log.info(f"🔍 Sending create command for {actor_name} to {node_id}")
 
-        # Находим правильный connection_id
-        connection_id = self._find_connection_for_node(node_id)
-
-        if connection_id and connection_id != self.config.node_id:
-            log.info(f"📤 Sending {action} command for {actor_name} to {node_id} via {connection_id}")
-            await self._send_msg(
-                connection_id,
-                {
-                    "type": "replica_command",
-                    "actor_name": actor_name,
-                    "action": action,
-                    "from_leader": self.config.node_id
-                }
-            )
-            return True
-        elif node_id == self.config.node_id:
-            # Обрабатываем команду для себя напрямую
-            log.info(f"⚡ Processing {action} command locally for {actor_name}")
-            await self._process_replica_command({
-                "actor_name": actor_name,
-                "action": action
-            })
+        if node_id == self.config.node_id:
+            # Создаем локально
+            await self._create_local_actor(actor_name, replica_index)
             return True
         else:
-            log.warning(f"🚫 Cannot send command to {node_id} - no connection found")
-            log.warning(f"   Available connections: {list(self.conn.keys())}")
-            log.warning(f"   Available members: {list(self.members.keys())}")
-            return False
+            # Отправляем на удаленную ноду
+            connection_id = self._find_connection_for_node(node_id)
+            if connection_id:
+                await self._send_msg(
+                    connection_id,
+                    {
+                        "type": "replica_command",
+                        "actor_name": actor_name,
+                        "action": "create",
+                        "replica_index": replica_index,
+                        "from_leader": self.config.node_id
+                    }
+                )
+                return True
+            else:
+                log.warning(f"🚫 No connection to node {node_id}")
+                return False
 
-    async def ensure_replicas(self):
-        """Гарантирует нужное количество реплик (только для не-лидеров)"""
-        if self._is_leader:
-            return  # Лидер сам оркестрирует реплики
-
-        for defn in registry._definitions.values():
-            if not defn.dynamic and defn.replicas > 1:
-                # Не-лидеры только проверяют статус
-                current_count = len(registry.get_actor_replicas(defn.name))
-                if current_count != defn.replicas:
-                    log.debug(f"Static actor {defn.name}: {current_count}/{defn.replicas} replicas (waiting for leader)")
-
-    async def _create_local_replica(self, defn: ActorDefinition):
-        """Создает локальную реплику статического актора"""
+    async def _create_local_actor(self, actor_name: str, replica_index: int):
+        """Создает актор локально по команде оркестрации"""
         try:
+            # Находим определение актора
+            defn = None
+            for d in registry._definitions.values():
+                if d.name == actor_name:
+                    defn = d
+                    break
+
+            if not defn:
+                log.error(f"❌ Actor definition not found: {actor_name}")
+                return
+
+            # Создаем актор
             actor_instance = defn.cls()
 
-            # Используем node_id в имени реплики для уникальности
-            replica_name = f"{defn.name}-{self.config.node_id}"
-            ref = self.system.create(actor_instance, name=replica_name)
+            # 🔥 СОХРАНЯЕМ ОРИГИНАЛЬНОЕ ИМЯ АКТОРА
+            replica_name = defn.name  # Всегда используем оригинальное имя!
 
-            # Регистрируем реплику локально
+            # Создаем актор
+            ref = None
+            if defn.parent:
+                # Создаем как дочерний актор через текущий ClusterActor
+                ref = self.create(actor_instance, name=replica_name)
+                log.info(f"✅ Created child actor {replica_name} via ClusterActor.create() on {self.config.node_id}")
+            else:
+                # Корневой актор - создаем напрямую
+                ref = self.system.create(actor_instance, name=replica_name)
+                log.info(f"✅ Created root actor: {replica_name} on {self.config.node_id}")
+
+            # Регистрируем реплику
             registry._register_replica(defn.name, self.config.node_id, ref)
 
-            # Синхронизируем с кластером
-            await self._sync_replicas_to_cluster(defn.name, self.config.node_id, ref)
-
-            log.info(f"✅ Created local replica: {replica_name}")
+            # 🔥 Уведомляем кластер о новой реплике
+            await self._broadcast_replica_update(defn.name, "add", ref)
 
             # Обновляем счетчик акторов
             if self.config.node_id in self.members:
@@ -520,68 +581,100 @@ class ClusterActor(Actor):
                 self.crush_mapper.update_nodes(self.members)
 
         except Exception as e:
-            log.error(f"❌ Failed to create replica for {defn.name}: {e}")
+            log.error(f"❌ Failed to create local actor {actor_name}: {e}")
+            import traceback
+            log.error(traceback.format_exc())
+
+    async def _broadcast_replica_update(self, actor_name: str, action: str, actor_ref: ActorRef = None):
+        """Рассылает обновление о реплике всем нодам кластера"""
+        if not self._cluster_initialized:
+            return
+
+        message = {
+            "type": "replica_update",
+            "actor_name": actor_name,
+            "node_id": self.config.node_id,
+            "action": action,
+            "timestamp": time.time()
+        }
+
+        if action == "add" and actor_ref:
+            message["actor_ref"] = {
+                "actor_id": actor_ref.actor_id,
+                "path": actor_ref.path,
+                "name": actor_ref.name
+            }
+
+        # Рассылаем всем подключенным нодам
+        for node_id in self.conn:
+            if node_id != self.config.node_id:  # Не отправляем себе
+                try:
+                    await self._send_msg(node_id, message)
+                    log.info(f"📢 Broadcasted replica update for {actor_name} to {node_id}")
+                except Exception as e:
+                    log.error(f"❌ Failed to broadcast replica update to {node_id}: {e}")
+
+    async def _process_replica_command(self, message: Dict[str, Any]):
+        """Обрабатывает команды реплик от лидера"""
+        actor_name = message["actor_name"]
+        action = message["action"]
+        replica_index = message.get("replica_index", 0)
+
+        log.info(f"Processing replica command: {action} for {actor_name}")
+
+        if action == "create":
+            log.info(f"Creating local replica for {actor_name}")
+            await self._create_local_actor(actor_name, replica_index)
+        elif action == "remove":
+            log.info(f"Removing local replica for {actor_name}")
+            await self._stop_local_replica(actor_name)
 
     async def _stop_local_replica(self, actor_name: str):
         """Удаляет локальную реплику и уведомляет кластер"""
         replicas = registry.get_actor_replicas(actor_name)
         if self.config.node_id in replicas:
             actor_ref = replicas[self.config.node_id]
-
-            # Останавливаем актор
             self.system.stop(actor_ref)
 
-            # Удаляем из registry
             if actor_name in registry._actor_replicas and self.config.node_id in registry._actor_replicas[actor_name]:
                 del registry._actor_replicas[actor_name][self.config.node_id]
 
-            # Уведомляем кластер
-            await self._sync_replica_removal(actor_name, self.config.node_id)
+            # 🔥 Уведомляем кластер об удалении реплики
+            await self._broadcast_replica_update(actor_name, "remove")
 
-            log.info(f"Removed local replica {actor_name} from node {self.config.node_id}")
+            log.info(f"🗑️ Removed local replica {actor_name} from node {self.config.node_id}")
 
-    async def _sync_replicas_to_cluster(self, actor_name: str, node_id: str, actor_ref: ActorRef):
-        """Синхронизирует информацию о репликах с кластером"""
-        for target_node in self.conn:
-            await self._send_msg(
-                target_node,
-                {
-                    "type": "replica_update",
-                    "actor_name": actor_name,
-                    "node_id": node_id,
-                    "actor_ref": {
-                        "actor_id": actor_ref.actor_id,
-                        "path": actor_ref.path,
-                        "name": actor_ref.name
-                    },
-                    "action": "add"
-                }
+    async def _process_replica_update(self, message: Dict[str, Any]):
+        """Обрабатывает обновления реплик от других нод"""
+        actor_name = message["actor_name"]
+        node_id = message["node_id"]
+        action = message["action"]
+
+        log.info(f"🔄 Processing replica update: {action} for {actor_name} from {node_id}")
+
+        if action == "add":
+            actor_ref_data = message["actor_ref"]
+            actor_ref = ActorRef(
+                actor_id=actor_ref_data["actor_id"],
+                path=actor_ref_data["path"],
+                name=actor_ref_data["name"]
             )
+            registry._register_replica(actor_name, node_id, actor_ref)
+            log.info(f"✅ Registered remote replica {actor_name} from node {node_id}: {actor_ref}")
 
-    async def _sync_replica_removal(self, actor_name: str, node_id: str):
-        """Синхронизирует удаление реплики с кластером"""
-        for target_node in self.conn:
-            await self._send_msg(
-                target_node,
-                {
-                    "type": "replica_update",
-                    "actor_name": actor_name,
-                    "node_id": node_id,
-                    "action": "remove"
-                }
-            )
+        elif action == "remove":
+            if actor_name in registry._actor_replicas and node_id in registry._actor_replicas[actor_name]:
+                del registry._actor_replicas[actor_name][node_id]
+                log.info(f"🗑️ Removed remote replica {actor_name} from node {node_id}")
 
-    async def _replica_monitor_loop(self):
-        """Мониторинг и поддержание реплик статических акторов"""
-        while True:
-            try:
-                await self.ensure_replicas()
-                await asyncio.sleep(10)
-            except Exception as e:
-                log.error(f"Error in replica monitoring: {e}")
-                await asyncio.sleep(30)
+        # Обновляем маппер
+        self.crush_mapper.update_nodes(self.members)
 
-    # Сетевые методы
+        # Логируем текущее состояние
+        replicas = registry.get_actor_replicas(actor_name)
+        log.info(f"📊 Current replicas for {actor_name}: {list(replicas.keys())}")
+
+    # Остальные сетевые методы остаются без изменений
     async def _goss_loop(self):
         while True:
             if self.goss_tgt:
@@ -629,7 +722,6 @@ class ClusterActor(Actor):
         for attempt in range(max_retries):
             try:
                 reader, writer = await asyncio.open_connection(host, port)
-                # Используем host:port как node_id
                 node_id = f"{host}:{port}"
                 self.conn[node_id] = writer
 
@@ -672,7 +764,6 @@ class ClusterActor(Actor):
 
     async def _conn_hdl(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
-        # Используем IP:port как идентификатор
         node_id = f"{peer[0]}:{peer[1]}"
 
         log.info(f"New cluster connection from: {node_id}")
@@ -725,6 +816,9 @@ class ClusterActor(Actor):
             log.info(f"Node {message['node_id']} joined the cluster")
             self.crush_mapper.update_nodes(self.members)
 
+            # 🔥 Синхронизируем наши реплики с новой нодой
+            await self._sync_replicas_with_node(node_id)
+
         elif msg_type == "replica_update":
             await self._process_replica_update(message)
 
@@ -746,60 +840,31 @@ class ClusterActor(Actor):
                 self._context.letterbox.put_nowait((self.actor_ref, message))
                 log.debug(f"Injected route_message into letterbox for {self.actor_ref.path}")
 
-    async def _process_replica_update(self, message: Dict[str, Any]):
-        """Обрабатывает обновления реплик от других нод"""
-        actor_name = message["actor_name"]
-        node_id = message["node_id"]
-        action = message["action"]
+    async def _sync_replicas_with_node(self, node_id: str):
+        """Синхронизирует информацию о репликах с новой нодой"""
+        log.info(f"🔄 Syncing replicas with new node {node_id}")
 
-        if action == "add":
-            actor_ref_data = message["actor_ref"]
-            # Создаем ActorRef из данных
-            actor_ref = ActorRef(
-                actor_id=actor_ref_data["actor_id"],
-                path=actor_ref_data["path"],
-                name=actor_ref_data["name"]
-            )
-            registry._register_replica(actor_name, node_id, actor_ref)
-            log.info(f"Registered remote replica {actor_name} from node {node_id}")
-
-        elif action == "remove":
-            if actor_name in registry._actor_replicas and node_id in registry._actor_replicas[actor_name]:
-                del registry._actor_replicas[actor_name][node_id]
-                log.info(f"Removed remote replica {actor_name} from node {node_id}")
-
-        self.crush_mapper.update_nodes(self.members)
-
-    async def _process_replica_command(self, message: Dict[str, Any]):
-        """Обрабатывает команды реплик от лидера"""
-        actor_name = message["actor_name"]
-        action = message["action"]
-
-        log.info(f"Processing replica command: {action} for {actor_name}")
-
-        # Находим определение актора
-        defn = None
-        for d in registry._definitions.values():
-            if d.name == actor_name:
-                defn = d
-                break
-
-        if not defn:
-            log.error(f"Unknown actor definition: {actor_name}")
-            return
-
-        if action == "create":
-            log.info(f"Creating local replica for {actor_name}")
-            await self._create_local_replica(defn)
-        elif action == "remove":
-            log.info(f"Removing local replica for {actor_name}")
-            await self._stop_local_replica(actor_name)
+        for actor_name, replicas in registry._actor_replicas.items():
+            for replica_node_id, actor_ref in replicas.items():
+                if replica_node_id == self.config.node_id:  # Только наши реплики
+                    await self._send_msg(node_id, {
+                        "type": "replica_update",
+                        "actor_name": actor_name,
+                        "node_id": self.config.node_id,
+                        "action": "add",
+                        "actor_ref": {
+                            "actor_id": actor_ref.actor_id,
+                            "path": actor_ref.path,
+                            "name": actor_ref.name
+                        },
+                        "timestamp": time.time()
+                    })
+                    log.debug(f"📤 Synced replica {actor_name} to {node_id}")
 
     async def _process_leader_announcement(self, message: Dict[str, Any]):
         """Обрабатывает анонс лидерства от другой ноды"""
         announced_leader = message["leader_id"]
 
-        # Если объявленный лидер "меньше" текущего лидера, принимаем его
         alive_nodes = [
             node_id for node_id, member in self.members.items()
             if member.get("status") == "alive"
@@ -811,12 +876,10 @@ class ClusterActor(Actor):
         alive_nodes.sort()
         true_leader = alive_nodes[0]
 
-        # Сравниваем объявленного лидера с истинным лидером
         if announced_leader != true_leader:
             log.warning(f"Node {announced_leader} incorrectly announced leadership, true leader is {true_leader}")
             return
 
-        # Если это не мы и объявленный лидер корректен, снимаем свое лидерство
         if announced_leader != self.config.node_id and self._is_leader:
             log.info(f"Accepting {announced_leader} as true leader, stepping down")
             self._is_leader = False
@@ -836,6 +899,20 @@ class ClusterActor(Actor):
                     },
                 )
             await asyncio.sleep(3)
+
+    async def _announce_leadership(self):
+        """Анонсирует свое лидерство кластеру"""
+        self._last_leader_announcement = time.time()
+        for node_id in self.conn:
+            await self._send_msg(
+                node_id,
+                {
+                    "type": "leader_announcement",
+                    "leader_id": self.config.node_id,
+                    "timestamp": time.time()
+                }
+            )
+        log.info(f"🎯 Leader {self.config.node_id} announced leadership to cluster")
 
     async def _merge_member(self, remote_members: Dict[str, Dict], remote_incarnation: int):
         for node_id, remote_info in remote_members.items():
@@ -876,6 +953,8 @@ class ClusterActor(Actor):
             await asyncio.sleep(30)
 
     async def receive(self, sender: ActorRef, message: Any) -> None:
+        log.info(f"🔍 ClusterActor.receive called: {type(message).__name__} from {sender}")
+
         if isinstance(message, dict) and message.get("action") == "actio_broadcast":
             for node_id in self.conn:
                 await self._send_msg(node_id, message["payload"])

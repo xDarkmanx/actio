@@ -61,48 +61,33 @@ class ActorRegistry:
         system: 'ActorSystem',
         timeout: float = 5.0
     ) -> Dict[str, List[ActorRef]]:
+        """Создает ТОЛЬКО корневые акторы (parent=None) с сохранением оригинальных имен"""
         refs = {}
         actor_instances = {}
 
+        # ШАГ 1: Создаем ТОЛЬКО корневые акторы (parent=None)
         for defn in self._definitions.values():
-            if defn.parent is None:
+            if defn.parent is None:  # Только корневые акторы
                 refs[defn.name] = []
 
-                # Создаем N реплик для корневых акторов
-                for i in range(defn.replicas):
-                    actor_instance = defn.cls()
-                    replica_name = f"{defn.name}-replica-{i}" if defn.replicas > 1 else defn.name
-                    ref = system.create(actor_instance, name=replica_name)
-                    refs[defn.name].append(ref)
-                    actor_instances[replica_name] = actor_instance
+                # Создаем актор с оригинальным именем
+                actor_instance = defn.cls()
 
-                    # 👇 РЕГИСТРИРУЕМ РЕПЛИКУ через ClusterActor если он есть
-                    if hasattr(actor_instance, 'config') and actor_instance.config:
-                        # Актор является ClusterActor и имеет конфиг
-                        self._register_replica(defn.name, actor_instance.config.node_id, ref)
-                    else:
-                        # Обычный актор - регистрируем как "local"
-                        self._register_replica(defn.name, "local", ref)
+                # Получаем node_id для регистрации
+                node_id = "local"
+                if hasattr(actor_instance, 'config') and actor_instance.config:
+                    node_id = actor_instance.config.node_id
 
-        # Создаем дочерние акторы (пока без репликации для детей)
-        created = set(refs.keys())
-        while len(created) < len(self._definitions):
-            for defn in self._definitions.values():
-                if defn.name not in created and defn.parent in created:
-                    parent_instance = actor_instances.get(defn.parent)
-                    if parent_instance:
-                        actor_instance = defn.cls()
-                        child_ref = parent_instance.create(actor_instance, name=defn.name)
-                        refs[defn.name] = [child_ref]  # Дети пока без реплик
-                        actor_instances[defn.name] = actor_instance
+                # Создаем с оригинальным именем!
+                ref = system.create(actor_instance, name=defn.name)
+                refs[defn.name].append(ref)
+                actor_instances[defn.name] = actor_instance
 
-                        # Сохраняем ссылку в родителе
-                        if hasattr(parent_instance, 'actors') and isinstance(parent_instance.actors, dict):
-                            parent_instance.actors[defn.name] = child_ref
+                # Регистрируем под оригинальным именем
+                self._register_replica(defn.name, node_id, ref)
+                log.info(f"🏁 Created root actor: {defn.name} on node {node_id}")
 
-                        created.add(defn.name)
-
-        # Ждем инициализации акторов
+        # ШАГ 2: Ждем инициализации корневых акторов
         start_time = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() - start_time < timeout:
             all_started = True
@@ -119,14 +104,24 @@ class ActorRegistry:
                 break
             await asyncio.sleep(0.1)
 
+        log.info("✅ Root actors started. Waiting for leader orchestration...")
         return refs
+
+    def get_actors_for_orchestration(self) -> List[ActorDefinition]:
+        """Возвращает акторы для оркестрации CrushMapper"""
+        actors = []
+        for defn in self._definitions.values():
+            # Оркестрируем: dynamic=False И parent != None
+            if defn.dynamic is False and defn.parent is not None:
+                actors.append(defn)
+        return actors
 
     def _register_replica(self, actor_name: str, node_id: str, actor_ref: ActorRef):
         """Регистрирует реплику актора"""
         if actor_name not in self._actor_replicas:
             self._actor_replicas[actor_name] = {}
         self._actor_replicas[actor_name][node_id] = actor_ref
-        log.debug(f"Registered replica {actor_name} on node {node_id}")
+        log.info(f"✅ Registered replica {actor_name} on node {node_id}: {actor_ref}")
 
     def register_instance(self, template_name: str, actor_ref: ActorRef):
         """Регистрируем созданный экземпляр динамического актора"""
@@ -136,6 +131,7 @@ class ActorRegistry:
 
     def get_actor_replicas(self, actor_name: str) -> Dict[str, ActorRef]:
         """Возвращает все реплики актора {node_id: ActorRef}"""
+        log.debug(f"🔍 Registry lookup for {actor_name}: available keys {list(self._actor_replicas.keys())}")
         return self._actor_replicas.get(actor_name, {})
 
     def get_any_replica(self, actor_name: str) -> Optional[ActorRef]:
