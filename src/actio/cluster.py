@@ -91,7 +91,11 @@ class CrushMapper:
             actor_hash = hash(actor_name) % len(available_nodes)
             selected_node = available_nodes[actor_hash]
 
-            log.info(f"🎯 CrushMapper round-robin mapped {actor_name} to node: {selected_node} (from available: {available_nodes})")
+            log.info(
+                f"🎯 CrushMapper round-robin mapped {actor_name} "
+                f"to node: {selected_node} "
+                f"(from available: {available_nodes})"
+            )
             return [selected_node]
 
         actor_hash = int(hashlib.md5(actor_name.encode()).hexdigest()[:8], 16)
