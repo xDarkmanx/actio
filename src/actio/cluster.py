@@ -7,6 +7,7 @@ import json
 import time
 import random
 import hashlib
+import socket
 
 from typing import Any
 from typing import Dict
@@ -311,12 +312,16 @@ class ClusterActor(Actor):
             log.warning(f"🚫 Could not determine target node for {destination}")
             return False
 
-        # 🔥 ФИКС: Если целевая нода - это текущая нода, обрабатываем локально
+        if (target_node_id in self.members and
+            self.members[target_node_id].get("status") != "alive"):
+
+            log.warning(f"🚫 Target node {target_node_id} is not alive (status: {self.members[target_node_id].get('status')}). Skipping cluster routing.")
+            return False
+
         if target_node_id == self.config.node_id:
             log.info(f"🎯 Target is local, delivering to {destination}")
 
-            # 🔥 ВАЖНО: Не меняем сообщение, доставляем как есть!
-            # Просто передаем сообщение локальной системе маршрутизации
+            # Это гарантирует что сообщение пройдет всю цепочку маршрутизации правильно!
             handled = await super()._route_message_logic(sender, message)
             if handled:
                 log.info(f"✅ Local message delivered to {destination}")
@@ -379,7 +384,6 @@ class ClusterActor(Actor):
 
         log.info(f"📡 Forwarding to node {node_id}: {message.get('destination', 'no destination')}")
 
-        # 🔥 ФИКС: Проверяем, не пытаемся ли отправить себе
         if node_id == self.config.node_id:
             log.info("🎯 Message is for local node, processing locally")
             # Доставляем сообщение локально
@@ -397,8 +401,6 @@ class ClusterActor(Actor):
                 return False
         else:
             log.warning(f"🚫 No connection to node {node_id}")
-
-            # 🔥 Пробуем найти альтернативное соединение
             for conn_id in self.conn.keys():
                 if node_id in conn_id or conn_id in node_id:
                     try:
@@ -413,17 +415,14 @@ class ClusterActor(Actor):
 
     def _find_connection_for_node(self, node_id: str) -> Optional[str]:
         """Находит соединение для указанной ноды"""
-        # 🔥 ФИКС: Сначала проверяем точное совпадение
         if node_id in self.conn:
             return node_id
 
-        # 🔥 ФИКС: Проверяем частичные совпадения (host:port форматы)
         for conn_id in self.conn.keys():
             # Если node_id это "api2", а conn_id это "api2:7946" - считаем что подходит
             if node_id in conn_id or conn_id in node_id:
                 return conn_id
 
-        # 🔥 ФИКС: Проверяем через members информацию
         if node_id in self.members:
             member_address = self.members[node_id].get('address', '')
             if member_address:
@@ -436,14 +435,46 @@ class ClusterActor(Actor):
         return None
 
     async def _leader_election_loop(self):
-        """Цикл выборов лидера"""
+        """Цикл выборов лидера с мониторингом изменений в кластере"""
+        last_member_state = None
+
         while True:
             try:
                 await self._run_leader_election()
-                await asyncio.sleep(10)
+                current_member_state = {
+                    node_id: member.get("status", "alive")
+                    for node_id, member in self.members.items()
+                }
+
+                # Если лидер и состояние кластера изменилось
+                if (self._is_leader and
+                    current_member_state != last_member_state and
+                    self._orchestration_done):
+
+                    # Фильтруем только значимые изменения (появление/исчезновение живых нод)
+                    alive_nodes_now = {k for k, v in current_member_state.items() if v == "alive"}
+                    alive_nodes_before = {k for k, v in (last_member_state or {}).items() if v == "alive"}
+
+                    if alive_nodes_now != alive_nodes_before:
+                        log.info(f"🔄 Cluster membership changed! "
+                                f"Alive nodes: {len(alive_nodes_now)} (was {len(alive_nodes_before)}). "
+                                f"Re-orchestrating...")
+
+                        self._orchestration_done = False
+                        if self._orchestration_task and not self._orchestration_task.done():
+                            self._orchestration_task.cancel()
+
+                        self._orchestration_task = asyncio.create_task(self._orchestrate_all_actors())
+
+                last_member_state = current_member_state
+                await asyncio.sleep(10)  # Проверяем каждые 10 секунд
+
+            except asyncio.CancelledError:
+                log.info("Leader election loop cancelled")
+                break
             except Exception as e:
-                log.error(f"Error in leader election: {e}")
-                await asyncio.sleep(30)
+                log.error(f"❌ Error in leader election loop: {e}")
+                await asyncio.sleep(30)  # Подождем подольше при ошибках
 
     async def _run_leader_election(self):
         """Выборы лидера - самая маленькая нода становится лидером"""
@@ -478,7 +509,7 @@ class ClusterActor(Actor):
                 self._orchestration_task = None
 
     async def _orchestrate_all_actors(self):
-        """Оркестрирует ВСЕ static акторы (вызывается только у лидера)"""
+        """Оркестрирует ВСЕ static акторы с ПОЛНЫМ cleanup мертвых реплик"""
         if not self._is_leader:
             return
 
@@ -487,7 +518,21 @@ class ClusterActor(Actor):
 
         log.info("🔄 Leader starting orchestration of all static actors...")
 
-        # Получаем акторы для оркестрации
+        cleanup_count = 0
+        for actor_name in list(registry._actor_replicas.keys()):
+            for node_id in list(registry._actor_replicas[actor_name].keys()):
+                # Удаляем реплику если нода мертва ИЛИ реплика не соответствует текущему распределению
+                if (node_id in self.members and
+                    self.members[node_id].get("status") == "dead"):
+
+                    # Удаляем реплику с мертвой ноды
+                    del registry._actor_replicas[actor_name][node_id]
+                    cleanup_count += 1
+                    log.info(f"🧹 Cleaned up dead replica {actor_name} from node {node_id}")
+
+        if cleanup_count > 0:
+            log.info(f"✅ Cleaned up {cleanup_count} dead replicas")
+
         actors_to_orchestrate = registry.get_actors_for_orchestration()
 
         if not actors_to_orchestrate:
@@ -497,22 +542,55 @@ class ClusterActor(Actor):
 
         log.info(f"🎯 Orchestrating {len(actors_to_orchestrate)} actors: {[a.name for a in actors_to_orchestrate]}")
 
-        # Обновляем веса нод
         self.crush_mapper.update_nodes(self.members)
-
-        # Распределяем акторы по нодам
         placement = self.crush_mapper.map_actors_to_nodes(actors_to_orchestrate)
 
-        # Рассылаем команды создания
         commands_sent = 0
         for node_id, actor_assignments in placement.items():
-            for actor_name, replica_index in actor_assignments:
-                success = await self._send_create_command(node_id, actor_name, replica_index)
-                if success:
-                    commands_sent += 1
+            # Проверяем что нода живая
+            if (node_id in self.members and
+                self.members[node_id].get("status") == "alive"):
+
+                for actor_name, replica_index in actor_assignments:
+                    current_replicas = registry.get_actor_replicas(actor_name)
+
+                    # Если на этой ноде еще нет реплики - создаем
+                    if node_id not in current_replicas:
+                        success = await self._send_create_command(node_id, actor_name, replica_index)
+                        if success:
+                            commands_sent += 1
+                    else:
+                        log.debug(f"✅ Replica {actor_name} already exists on alive node {node_id}")
+
+        final_cleanup_count = 0
+        for actor_name in [a.name for a in actors_to_orchestrate]:
+            current_replicas = registry.get_actor_replicas(actor_name)
+            expected_nodes = set()
+
+            # Собираем ожидаемые ноды из placement
+            for node_id, assignments in placement.items():
+                if node_id in self.members and self.members[node_id].get("status") == "alive":
+                    for assigned_actor, _ in assignments:
+                        if assigned_actor == actor_name:
+                            expected_nodes.add(node_id)
+
+            # Удаляем реплики которых не должно быть
+            for node_id in list(current_replicas.keys()):
+                if node_id not in expected_nodes:
+                    del registry._actor_replicas[actor_name][node_id]
+                    final_cleanup_count += 1
+                    log.info(f"🧹 Removed orphaned replica {actor_name} from node {node_id}")
+
+        if final_cleanup_count > 0:
+            log.info(f"✅ Final cleanup: removed {final_cleanup_count} orphaned replicas")
 
         log.info(f"✅ Leader sent {commands_sent} create commands")
         self._orchestration_done = True
+
+        log.info("📊 Final replica distribution:")
+        for actor_name in [a.name for a in actors_to_orchestrate]:
+            replicas = registry.get_actor_replicas(actor_name)
+            log.info(f"   {actor_name}: {list(replicas.keys())}")
 
     async def _send_create_command(self, node_id: str, actor_name: str, replica_index: int):
         """Отправляет команду создания актора на ноду"""
@@ -555,11 +633,8 @@ class ClusterActor(Actor):
                 log.error(f"❌ Actor definition not found: {actor_name}")
                 return
 
-            # Создаем актор
             actor_instance = defn.cls()
-
-            # 🔥 СОХРАНЯЕМ ОРИГИНАЛЬНОЕ ИМЯ АКТОРА
-            replica_name = defn.name  # Всегда используем оригинальное имя!
+            replica_name = defn.name
 
             # Создаем актор
             ref = None
@@ -643,7 +718,6 @@ class ClusterActor(Actor):
             if actor_name in registry._actor_replicas and self.config.node_id in registry._actor_replicas[actor_name]:
                 del registry._actor_replicas[actor_name][self.config.node_id]
 
-            # 🔥 Уведомляем кластер об удалении реплики
             await self._broadcast_replica_update(actor_name, "remove")
 
             log.info(f"🗑️ Removed local replica {actor_name} from node {self.config.node_id}")
@@ -696,25 +770,85 @@ class ClusterActor(Actor):
             await asyncio.sleep(1)
 
     async def _failure_detect(self):
+        """Обнаружение сбоев с очисткой ресурсов и автоматическим re-orchestration"""
         while True:
             now = time.time()
+            cluster_changed = False
+            dead_nodes_detected = []
+            suspect_nodes_detected = []
+            recovered_nodes_detected = []
+
             for node_id, member in list(self.members.items()):
                 if node_id == self.config.node_id:
                     continue
 
-                if now - member["last_seen"] > 10:
-                    if member["status"] != "dead":
-                        member["status"] = "dead"
-                        log.warning(f"Node {node_id} marked as dead")
-                        self.crush_mapper.update_nodes(self.members)
+                old_status = member.get("status", "alive")
 
-                elif now - member["last_seen"] > 5:
-                    if member["status"] != "suspect":
-                        member["status"] = "suspect"
-                        log.warning(f"Node {node_id} is suspect")
-                        self.crush_mapper.update_nodes(self.members)
+                if now - member["last_seen"] > self.config.failure_timeout:
+                    member["status"] = "dead"
 
-            await asyncio.sleep(2)
+                elif now - member["last_seen"] > self.config.failure_timeout / 2:
+                    member["status"] = "suspect"
+
+                elif member["status"] != "alive":
+                    member["status"] = "alive"
+
+                if member["status"] != old_status:
+                    cluster_changed = True
+
+                    if member["status"] == "dead":
+                        dead_nodes_detected.append(node_id)
+                        log.warning(f"🚨 Node {node_id} marked as DEAD (was {old_status})")
+
+                        if node_id in self.conn:
+                            writer = self.conn.pop(node_id)
+                            try:
+                                writer.close()
+                                await writer.wait_closed()
+                                log.debug(f"🧹 Closed connection to dead node: {node_id}")
+                            except Exception as e:
+                                log.debug(f"🔧 Error closing connection to {node_id}: {e}")
+
+                    elif member["status"] == "suspect":
+                        suspect_nodes_detected.append(node_id)
+                        log.warning(f"⚠️  Node {node_id} is SUSPECT (was {old_status})")
+
+                    elif member["status"] == "alive":
+                        recovered_nodes_detected.append(node_id)
+                        log.info(f"✅ Node {node_id} recovered to ALIVE (was {old_status})")
+
+                    self.crush_mapper.update_nodes(self.members)
+
+            if (
+                self._is_leader
+                and cluster_changed
+                and dead_nodes_detected
+                and self._orchestration_done
+            ):
+                log.info(
+                    f"🔄 Cluster topology changed! "
+                    f"Dead nodes: {dead_nodes_detected}, "
+                    f"Suspect: {suspect_nodes_detected}, "
+                    f"Recovered: {recovered_nodes_detected}. "
+                    f"Re-orchestrating..."
+                )
+
+                self._orchestration_done = False
+
+                # Отменяем предыдущую задачу оркестрации если есть
+                if self._orchestration_task and not self._orchestration_task.done():
+                    self._orchestration_task.cancel()
+
+                # Запускаем новую оркестрацию
+                self._orchestration_task = asyncio.create_task(self._orchestrate_all_actors())
+
+            elif cluster_changed:
+                log.debug(f"📊 Cluster status changed - "
+                        f"Dead: {dead_nodes_detected}, "
+                        f"Suspect: {suspect_nodes_detected}, "
+                        f"Recovered: {recovered_nodes_detected}")
+
+            await asyncio.sleep(2)  # Проверяем каждые 2 секунды
 
     async def _nodes_conn(self):
         for node in self.config.cluster_nodes:
@@ -722,7 +856,8 @@ class ClusterActor(Actor):
             if node_host != self.config.node_id:
                 await self._node_conn(host=node_host, port=int(node_port))
 
-    async def _node_conn(self, host: str, port: int, max_retries: int = 5):
+    async def _node_conn(self, host: str, port: int, max_retries: int = 3) -> bool:
+        """Пытается подключиться к ноде с обработкой ошибок и exponential backoff"""
         for attempt in range(max_retries):
             try:
                 reader, writer = await asyncio.open_connection(host, port)
@@ -740,15 +875,29 @@ class ClusterActor(Actor):
                     },
                 )
 
-                log.info(f"Connected to {node_id}")
+                log.info(f"✅ Connected to {node_id}")
                 return True
 
-            except ConnectionRefusedError:
+            except (ConnectionRefusedError, socket.gaierror) as e:
+                error_type = "DNS resolution failed" if isinstance(e, socket.gaierror) else "Connection refused"
+
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
+                    backoff_delay = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
+                    log.debug(f"🔄 Connection attempt {attempt + 1}/{max_retries} to {host}:{port} failed: {error_type}. Retrying in {backoff_delay}s")
+                    await asyncio.sleep(backoff_delay)
                 else:
-                    log.debug(f"Node {host}:{port} not available")
+                    log.debug(f"🚫 Node {host}:{port} not available after {max_retries} attempts: {error_type}")
                     return False
+
+            except asyncio.CancelledError:
+                log.debug(f"🔌 Connection attempt to {host}:{port} cancelled")
+                return False
+
+            except Exception as e:
+                log.debug(f"⚠️ Unexpected error connecting to {host}:{port}: {e}")
+                return False
+
+        return False
 
     async def _node_lstn(self, reader: asyncio.StreamReader, node_id: str):
         try:
@@ -942,19 +1091,54 @@ class ClusterActor(Actor):
                     self.members[node_id]["status"] = remote_info["status"]
 
     async def _background_connector(self):
+        """Умный коннектор, который избегает подключений к мертвым и проблемным нодам"""
+        connection_attempts = {}  # node_id -> last_attempt_time
+
         while True:
+            current_time = time.time()
+
             for node in self.config.cluster_nodes:
-                node_host, node_port = node.split(":")
-                node_id = f"{node_host}:{node_port}"
+                try:
+                    node_host, node_port = node.split(":")
+                    node_id = f"{node_host}:{node_port}"
 
-                if (
-                    node_host != self.config.node_id and
-                    node_id not in self.conn and
-                    node_id not in self.members.get("dead", [])
-                ):
-                    await self._node_conn(node_host, int(node_port))
+                    if node_host == self.config.node_id:
+                        continue
 
-            await asyncio.sleep(30)
+                    if node_id in self.conn:
+                        continue
+
+                    if (node_id in self.members and
+                        self.members[node_id].get("status") == "dead"):
+                        continue
+
+                    last_attempt = connection_attempts.get(node_id, 0)
+                    if (node_id in self.members and
+                        self.members[node_id].get("status") in ["suspect", "unreachable"] and
+                        current_time - last_attempt < 45):
+                        continue
+
+                    log.debug(f"🔗 Attempting connection to {node_id}")
+                    success = await self._node_conn(node_host, int(node_port))
+                    connection_attempts[node_id] = current_time
+
+                    if not success:
+                        # Помечаем ноду как проблемную для временного игнорирования
+                        if node_id not in self.members:
+                            self.members[node_id] = {
+                                "status": "unreachable",
+                                "last_seen": current_time,
+                                "incarnation": 0
+                            }
+                        elif self.members[node_id].get("status") == "alive":
+                            self.members[node_id]["status"] = "unreachable"
+                            self.members[node_id]["last_seen"] = current_time
+
+                except Exception as e:
+                    log.debug(f"🔧 Background connector error for {node}: {e}")
+                    # Не прерываем цикл из-за ошибки в одной ноде
+
+            await asyncio.sleep(15)  # 1 минута вместо 30 секунд
 
     async def receive(self, sender: ActorRef, message: Any) -> None:
         log.info(f"🔍 ClusterActor.receive called: {type(message).__name__} from {sender}")

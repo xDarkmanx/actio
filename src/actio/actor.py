@@ -203,7 +203,6 @@ class Actor:
 
 class ActorSystem:
     """Система акторов."""
-
     def __init__(self):
         self._actors: Dict[ActorRef, '_ActorContext'] = {}
         self._is_stopped = asyncio.Event()
@@ -439,7 +438,6 @@ class ActorSystem:
 
 class _ActorContext:
     """Контекст выполнения актора."""
-
     def __init__(self, system: ActorSystem, actor_ref: ActorRef, parent: Optional[ActorRef]):
         self.system: ActorSystem = system
         self.actor_ref: ActorRef = actor_ref
