@@ -7,6 +7,7 @@ import asyncio
 from typing import Dict
 from typing import Any
 from typing import Optional
+from typing import Union
 from typing import List
 from typing import TYPE_CHECKING
 
@@ -30,7 +31,7 @@ class ActorRegistry:
         self,
         name: Optional[str] = None,
         parent: Optional[str] = None,
-        replicas: int = 1,
+        replicas: Union[int, str] = 1,
         minimal: int = 1,
         dynamic: bool = False,
         config: Optional[Dict[str, Any]] = None
@@ -38,6 +39,9 @@ class ActorRegistry:
 
         def decorator(cls):
             actor_name = name or cls.__name__
+            if isinstance(replicas, str) and replicas != 'all':
+                raise ValueError(f"Invalid replicas value: {replicas}. Must be integer or 'all'")
+
             definition = ActorDefinition(
                 name=actor_name,
                 cls=cls,

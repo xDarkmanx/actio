@@ -4,6 +4,7 @@
 from typing import Dict
 from typing import Any
 from typing import Optional
+from typing import Union
 
 from dataclasses import dataclass
 from dataclasses import field
@@ -33,7 +34,7 @@ class ActorDefinition:
     name: str
     cls: type
     parent: Optional[str]
-    replicas: int = 1
+    replicas: Union[int, str] = 1
     minimal: int = 1
     dynamic: bool = False
     config: Dict[str, Any] = field(default_factory=dict)

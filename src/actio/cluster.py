@@ -14,7 +14,7 @@ from typing import Dict
 from typing import Set
 from typing import Optional
 from typing import List
-from typing import Tuple
+from typing import Union
 
 from actio import Terminated
 
@@ -33,6 +33,7 @@ class CrushMapper:
         self.virtual_nodes = 100
 
     def update_nodes(self, cluster_members):
+        """Обновляет информацию о нодах кластера"""
         self.nodes = {
             node_id: self._calculate_weight(member_data)
             for node_id, member_data in cluster_members.items()
@@ -41,7 +42,7 @@ class CrushMapper:
         log.debug(f"CrushMapper updated nodes: {list(self.nodes.keys())}")
 
     def _calculate_weight(self, member_data):
-        """Рассчитывает вес ноды на основе ресурсов"""
+        """Рассчитывает вес ноды на основе ресурсов и загрузки"""
         cpu_cores = member_data.get('resources', {}).get('cpu_cores', 4)
         memory_gb = member_data.get('resources', {}).get('memory_gb', 8)
         current_load = member_data.get('actor_count', 0)
@@ -51,7 +52,7 @@ class CrushMapper:
 
         return max(current_weight, 0.1)
 
-    def map_actors_to_nodes(self, actor_definitions: List[ActorDefinition]) -> Dict[str, List[Tuple[str, int]]]:
+    def map_actors_to_nodes(self, actor_definitions: List[ActorDefinition]) -> Dict[str, List[tuple]]:
         """Распределяет акторы по нодам: {node_id: [(actor_name, replica_index)]}"""
         if not self.nodes:
             return {}
@@ -69,56 +70,100 @@ class CrushMapper:
 
         return placement
 
-    def map_actor(self, actor_name: str, replicas: int = 1) -> List[str]:
-        """Распределяет реплики актора по нодам с учетом существующих реплик"""
+    def map_actor(self, actor_name: str, replicas: Union[int, str] = 1) -> List[str]:
+        """Распределяет реплики актора по нодам с учетом текущего состояния"""
         if not self.nodes:
             return []
 
-        # Получаем текущие реплики
+        # 🔥 Обработка replicas='all'
+        if replicas == 'all':
+            target_nodes = list(self.nodes.keys())
+            log.info(f"🎯 CrushMapper mapped {actor_name} to ALL nodes: {target_nodes}")
+            return target_nodes
+
+        # Преобразуем в int для обратной совместимости
+        replica_count = int(replicas) if isinstance(replicas, str) else replicas
+
         current_replicas = registry.get_actor_replicas(actor_name)
-
-        # Ноды которые уже имеют реплику
         nodes_with_replicas = set(current_replicas.keys())
-
-        # Все доступные ноды
         available_nodes = list(self.nodes.keys())
 
         if not available_nodes:
             return []
 
-        # 🔧 ФИКС: Для single-replica акторов используем round-robin распределение
-        if replicas == 1 and not nodes_with_replicas:
-            available_nodes.sort()  # Для детерминированности
-            actor_hash = hash(actor_name) % len(available_nodes)
-            selected_node = available_nodes[actor_hash]
+        # 🔥 Single-replica с улучшенной балансировкой
+        if replica_count == 1:
+            return self._map_single_replica(actor_name, nodes_with_replicas, available_nodes)
 
-            log.info(
-                f"🎯 CrushMapper round-robin mapped {actor_name} "
-                f"to node: {selected_node} "
-                f"(from available: {available_nodes})"
-            )
-            return [selected_node]
+        # 🔥 Multi-replica логика
+        return self._map_multi_replica(actor_name, replica_count, nodes_with_replicas, available_nodes)
 
+    def _map_single_replica(self, actor_name: str, nodes_with_replicas: set, available_nodes: List[str]) -> List[str]:
+        """Распределение single-replica акторов с балансировкой"""
+        # Стратегия 1: Если есть текущая реплика и нода жива - оставляем на ней
+        if nodes_with_replicas:
+            current_node = next(iter(nodes_with_replicas))
+            if current_node in available_nodes:
+                log.info(f"🎯 CrushMapper keeping {actor_name} on current node: {current_node}")
+                return [current_node]
+
+        # Стратегия 2: Round-robin распределение с учетом загрузки
+        available_nodes.sort()  # Для детерминированности
+        actor_hash = hash(actor_name) % len(available_nodes)
+        selected_node = available_nodes[actor_hash]
+
+        # Стратегия 3: Если выбранная нода перегружена - найти менее загруженную
+        selected_weight = self.nodes.get(selected_node, 1.0)
+        if selected_weight < 0.5:  # Нода перегружена
+            best_node = max(available_nodes, key=lambda n: self.nodes.get(n, 1.0))
+            log.info(f"🔄 CrushMapper rebalanced {actor_name} from {selected_node} to {best_node} (load balancing)")
+            return [best_node]
+
+        log.info(f"🎯 CrushMapper round-robin mapped {actor_name} to node: {selected_node}")
+        return [selected_node]
+
+    def _map_multi_replica(
+        self,
+        actor_name: str,
+        replica_count: int,
+        nodes_with_replicas: set,
+        available_nodes: List[str]
+    ) -> List[str]:
+        """Распределение multi-replica акторов"""
         actor_hash = int(hashlib.md5(actor_name.encode()).hexdigest()[:8], 16)
         placement = []
 
         # Сначала добавляем ноды которые уже имеют реплики (если нужно сохранить их)
         for node in list(nodes_with_replicas):
-            if len(placement) < replicas and node in available_nodes:
+            if len(placement) < replica_count and node in available_nodes:
                 placement.append(node)
                 available_nodes.remove(node)
+                log.debug(f"🔁 CrushMapper keeping existing replica {actor_name} on node: {node}")
 
         # Добавляем новые ноды если нужно больше реплик
-        while len(placement) < replicas and available_nodes:
-            # Используем взвешенный выбор на основе весов нод
+        while len(placement) < replica_count and available_nodes:
             selected_node = self._weighted_selection(available_nodes, actor_hash + len(placement))
             if selected_node:
                 placement.append(selected_node)
                 available_nodes.remove(selected_node)
+                log.debug(f"➕ CrushMapper adding new replica {actor_name} on node: {selected_node}")
             else:
                 break
 
-        log.info(f"CrushMapper mapped {actor_name} to nodes: {placement} (from available: {list(self.nodes.keys())})")
+        # Если все еще не хватает реплик - пытаемся использовать уже занятые ноды
+        if len(placement) < replica_count:
+            all_occupied_nodes = list(nodes_with_replicas) + placement
+            unique_occupied_nodes = list(set(all_occupied_nodes))
+
+            for node in unique_occupied_nodes:
+                if len(placement) < replica_count and node not in placement:
+                    placement.append(node)
+                    log.debug(f"🔄 CrushMapper reusing node {node} for {actor_name}")
+
+        log.info(
+            f"🎯 CrushMapper mapped {actor_name} to nodes: {placement} "
+            f"(requested: {replica_count}, available: {list(self.nodes.keys())})"
+        )
         return placement
 
     def _weighted_selection(self, available_nodes: List[str], seed: int) -> Optional[str]:
@@ -142,7 +187,44 @@ class CrushMapper:
         selected = random.choice(weighted_nodes)
         random.seed()  # Сбрасываем seed
 
+        log.debug(
+            f"🎲 Weighted selection: {selected} from {available_nodes} "
+            f"(weights: {[self.nodes.get(n, 1.0) for n in available_nodes]})"
+        )
         return selected
+
+    def get_optimal_node_for_actor(self, actor_name: str) -> Optional[str]:
+        """Возвращает оптимальную ноду для нового актора"""
+        if not self.nodes:
+            return None
+
+        available_nodes = list(self.nodes.keys())
+        if not available_nodes:
+            return None
+
+        # Выбираем ноду с максимальным весом (наименее загруженную)
+        best_node = max(available_nodes, key=lambda n: self.nodes.get(n, 1.0))
+        log.debug(
+            f"🏆 Optimal node for {actor_name}: {best_node} "
+            f"(weight: {self.nodes.get(best_node, 1.0)})"
+        )
+        return best_node
+
+    def get_node_load(self, node_id: str) -> float:
+        """Возвращает текущую нагрузку ноды (обратный вес)"""
+        weight = self.nodes.get(node_id, 1.0)
+        return 1.0 / weight if weight > 0 else float('inf')
+
+    def print_node_weights(self):
+        """Логирует текущие веса нод (для отладки)"""
+        if not self.nodes:
+            log.info("📊 No nodes available in CrushMapper")
+            return
+
+        log.info("📊 CrushMapper node weights:")
+        for node_id, weight in sorted(self.nodes.items(), key=lambda x: x[1], reverse=True):
+            load = 1.0 / weight if weight > 0 else float('inf')
+            log.info(f"   {node_id}: weight={weight:.2f}, load={load:.2f}")
 
 
 class ClusterActor(Actor):
@@ -238,7 +320,6 @@ class ClusterActor(Actor):
         log.info(f"✅ Cluster node {self.config.node_id} fully initialized")
 
     async def _route_message_logic(self, sender: ActorRef, message: Dict[str, Any]) -> bool:
-        """Логика маршрутизации сообщений с приоритетом кластерной маршрутизации"""
         action = message.get('action')
         if action != 'route_message':
             return False
@@ -246,12 +327,21 @@ class ClusterActor(Actor):
         destination = message.get('destination', '')
         log.info(f"🔍 ClusterActor routing: destination='{destination}' from {sender}")
 
-        # 1. Сначала проверяем маршрутизацию на конкретную ноду (node: префикс)
+        # 🔥 1.5. УМНЫЙ RESOLVE ЛОГИЧЕСКИХ ПУТЕЙ (НОВАЯ ЛОГИКА)
+        if '/' in destination and not destination.startswith('node:'):
+            resolved_destination = await self._resolve_logical_path(destination)
+            if resolved_destination:
+                log.info(f"🎯 Resolved logical path: {destination} → {resolved_destination}")
+                forward_message = message.copy()
+                forward_message['destination'] = resolved_destination
+                return await self._try_cluster_routing(forward_message, sender)
+
+        # 1. Существующая логика (node: префикс)
         if destination.startswith('node:'):
             log.info(f"🎯 Routing to specific node: {destination}")
             return await self._cluster_route(destination[5:], message, sender)
 
-        # 2. Если destination пустой - это сообщение для текущего актора
+        # 2. Существующая логика (пустой destination)
         if not destination:
             data = message.get('data')
             final_message = data if isinstance(data, dict) else {'data': data}
@@ -260,7 +350,7 @@ class ClusterActor(Actor):
             await self.receive(sender, final_message)
             return True
 
-        # 3. Пробуем найти актор в кластере (ПЕРЕД локальной логикой!)
+        # 3. Существующая логика (кластерная маршрутизация)
         if self._cluster_initialized:
             log.info(f"🌐 Attempting cluster routing for: {destination}")
             cluster_handled = await self._try_cluster_routing(message, sender)
@@ -268,14 +358,13 @@ class ClusterActor(Actor):
                 log.info("✅ Message routed via cluster")
                 return True
 
-        # 4. Только если кластерная маршрутизация не сработала - пробуем локально
+        # 4. Существующая логика (fallback к локальной)
         log.info(f"🔄 Falling back to local routing for: {destination}")
         handled_locally = await super()._route_message_logic(sender, message)
         if handled_locally:
             log.info("✅ Message handled locally")
             return True
 
-        # 5. Если ничего не сработало - логируем ошибку
         log.warning(f"🚫 Message could not be routed to: {destination}")
         return False
 
@@ -312,10 +401,15 @@ class ClusterActor(Actor):
             log.warning(f"🚫 Could not determine target node for {destination}")
             return False
 
-        if (target_node_id in self.members and
-            self.members[target_node_id].get("status") != "alive"):
-
-            log.warning(f"🚫 Target node {target_node_id} is not alive (status: {self.members[target_node_id].get('status')}). Skipping cluster routing.")
+        if (
+            target_node_id in self.members
+            and self.members[target_node_id].get("status") != "alive"
+        ):
+            log.warning(
+                f"🚫 Target node {target_node_id} is not alive "
+                f"(status: {self.members[target_node_id].get('status')}). "
+                f"Skipping cluster routing."
+            )
             return False
 
         if target_node_id == self.config.node_id:
@@ -447,18 +541,21 @@ class ClusterActor(Actor):
                 }
 
                 # Если лидер и состояние кластера изменилось
-                if (self._is_leader and
-                    current_member_state != last_member_state and
-                    self._orchestration_done):
-
+                if (
+                    self._is_leader
+                    and current_member_state != last_member_state
+                    and self._orchestration_done
+                ):
                     # Фильтруем только значимые изменения (появление/исчезновение живых нод)
                     alive_nodes_now = {k for k, v in current_member_state.items() if v == "alive"}
                     alive_nodes_before = {k for k, v in (last_member_state or {}).items() if v == "alive"}
 
                     if alive_nodes_now != alive_nodes_before:
-                        log.info(f"🔄 Cluster membership changed! "
-                                f"Alive nodes: {len(alive_nodes_now)} (was {len(alive_nodes_before)}). "
-                                f"Re-orchestrating...")
+                        log.info(
+                            f"🔄 Cluster membership changed! "
+                            f"Alive nodes: {len(alive_nodes_now)} (was {len(alive_nodes_before)}). "
+                            f"Re-orchestrating..."
+                        )
 
                         self._orchestration_done = False
                         if self._orchestration_task and not self._orchestration_task.done():
@@ -509,23 +606,21 @@ class ClusterActor(Actor):
                 self._orchestration_task = None
 
     async def _orchestrate_all_actors(self):
-        """Оркестрирует ВСЕ static акторы с ПОЛНЫМ cleanup мертвых реплик"""
+        """Оркестрирует ВСЕ static акторы с учетом parent-child отношений"""
         if not self._is_leader:
             return
 
-        # Ждем стабилизации кластера
         await asyncio.sleep(5)
-
         log.info("🔄 Leader starting orchestration of all static actors...")
 
+        # 🔥 ШАГ 1: Cleanup мертвых реплик (существующая логика)
         cleanup_count = 0
         for actor_name in list(registry._actor_replicas.keys()):
             for node_id in list(registry._actor_replicas[actor_name].keys()):
-                # Удаляем реплику если нода мертва ИЛИ реплика не соответствует текущему распределению
-                if (node_id in self.members and
-                    self.members[node_id].get("status") == "dead"):
-
-                    # Удаляем реплику с мертвой ноды
+                if (
+                    node_id in self.members
+                    and self.members[node_id].get("status") == "dead"
+                ):
                     del registry._actor_replicas[actor_name][node_id]
                     cleanup_count += 1
                     log.info(f"🧹 Cleaned up dead replica {actor_name} from node {node_id}")
@@ -543,18 +638,31 @@ class ClusterActor(Actor):
         log.info(f"🎯 Orchestrating {len(actors_to_orchestrate)} actors: {[a.name for a in actors_to_orchestrate]}")
 
         self.crush_mapper.update_nodes(self.members)
-        placement = self.crush_mapper.map_actors_to_nodes(actors_to_orchestrate)
 
+        # 🔥 ШАГ 2: УМНОЕ РАСПРЕДЕЛЕНИЕ С УЧЕТОМ PARENT
+        placement = {}
+
+        for defn in actors_to_orchestrate:
+            if defn.replicas == 'all':
+                target_nodes = list(self.crush_mapper.nodes.keys())
+            else:
+                target_nodes = self._get_target_nodes_for_actor(defn)
+
+            for replica_index, node_id in enumerate(target_nodes):
+                if node_id not in placement:
+                    placement[node_id] = []
+                placement[node_id].append((defn.name, replica_index))
+
+        # 🔥 ШАГ 3: Рассылаем команды создания
         commands_sent = 0
         for node_id, actor_assignments in placement.items():
-            # Проверяем что нода живая
-            if (node_id in self.members and
-                self.members[node_id].get("status") == "alive"):
-
+            if (
+                node_id in self.members
+                and self.members[node_id].get("status") == "alive"
+            ):
                 for actor_name, replica_index in actor_assignments:
                     current_replicas = registry.get_actor_replicas(actor_name)
 
-                    # Если на этой ноде еще нет реплики - создаем
                     if node_id not in current_replicas:
                         success = await self._send_create_command(node_id, actor_name, replica_index)
                         if success:
@@ -562,19 +670,18 @@ class ClusterActor(Actor):
                     else:
                         log.debug(f"✅ Replica {actor_name} already exists on alive node {node_id}")
 
+        # 🔥 ШАГ 4: Финальная очистка (существующая логика)
         final_cleanup_count = 0
         for actor_name in [a.name for a in actors_to_orchestrate]:
             current_replicas = registry.get_actor_replicas(actor_name)
             expected_nodes = set()
 
-            # Собираем ожидаемые ноды из placement
             for node_id, assignments in placement.items():
                 if node_id in self.members and self.members[node_id].get("status") == "alive":
                     for assigned_actor, _ in assignments:
                         if assigned_actor == actor_name:
                             expected_nodes.add(node_id)
 
-            # Удаляем реплики которых не должно быть
             for node_id in list(current_replicas.keys()):
                 if node_id not in expected_nodes:
                     del registry._actor_replicas[actor_name][node_id]
@@ -591,6 +698,108 @@ class ClusterActor(Actor):
         for actor_name in [a.name for a in actors_to_orchestrate]:
             replicas = registry.get_actor_replicas(actor_name)
             log.info(f"   {actor_name}: {list(replicas.keys())}")
+
+    def _get_target_nodes_for_actor(self, actor_def: ActorDefinition) -> List[str]:
+        if actor_def.parent:
+            parent_replicas = registry.get_actor_replicas(actor_def.parent)
+            if not parent_replicas:
+                log.warning(f"⚠️ Parent {actor_def.parent} not found for {actor_def.name}")
+                return []
+
+            # 🔥 ПРОВЕРЯЕМ КЛАСС РОДИТЕЛЯ ЧЕРЕЗ ОПРЕДЕЛЕНИЕ
+            parent_is_cluster_actor = False
+
+            for defn in registry._definitions.values():
+                if defn.name == actor_def.parent:
+                    if issubclass(defn.cls, ClusterActor):
+                        parent_is_cluster_actor = True
+                        log.info(f"🎯 Parent {actor_def.parent} is ClusterActor (class: {defn.cls.__name__})")
+                    break
+
+            # 🔥 ЕСЛИ РОДИТЕЛЬ ClusterActor - УЧИТЫВАЕМ replicas!
+            if parent_is_cluster_actor:
+                if actor_def.replicas == 'all':
+                    target_nodes = list(self.crush_mapper.nodes.keys())
+                    log.info(
+                        f"🎯 Distributing {actor_def.name} to ALL nodes "
+                        f"(parent is ClusterActor, replicas='all')"
+                    )
+                else:
+                    # Используем CrushMapper но с учетом что родитель на всех нодах
+                    target_nodes = self.crush_mapper.map_actor(actor_def.name, actor_def.replicas)
+                    log.info(
+                        f"🎯 Distributing {actor_def.name} to {target_nodes} "
+                        f"(parent is ClusterActor, replicas={actor_def.replicas})"
+                    )
+                return target_nodes
+
+            available_parent_nodes = [
+                node_id for node_id in parent_replicas.keys()
+                if node_id in self.crush_mapper.nodes
+            ]
+
+            if not available_parent_nodes:
+                log.warning(f"⚠️ No alive parent nodes for {actor_def.name}")
+                return []
+
+            # Если родитель на всех нодах - распределяем как корневой
+            if len(available_parent_nodes) == len(self.crush_mapper.nodes):
+                return self.crush_mapper.map_actor(actor_def.name, actor_def.replicas)
+
+            # Родитель на части нод - распределяем ТОЛЬКО по этим нодам
+            else:
+                original_nodes = self.crush_mapper.nodes
+                try:
+                    self.crush_mapper.nodes = {
+                        node_id: weight
+                        for node_id, weight in self.crush_mapper.nodes.items()
+                        if node_id in available_parent_nodes
+                    }
+
+                    target_nodes = self.crush_mapper.map_actor(actor_def.name, actor_def.replicas)
+
+                    log.info(
+                        f"🎯 Hierarchical mapping: {actor_def.name} -> {target_nodes} "
+                        f"(parent {actor_def.parent} on {available_parent_nodes})"
+                    )
+                    return target_nodes
+
+                finally:
+                    self.crush_mapper.nodes = original_nodes
+
+        # Корневой актор - распределяем по всем нодам
+        return self.crush_mapper.map_actor(actor_def.name, actor_def.replicas)
+
+    def _find_node_for_actor_ref(self, actor_ref: ActorRef) -> Optional[str]:
+        """Находит ноду для заданного ActorRef"""
+        for actor_name, replicas in registry._actor_replicas.items():
+            for node_id, ref in replicas.items():
+                if ref == actor_ref:
+                    return node_id
+        return None
+
+    async def _resolve_logical_path(self, destination: str) -> Optional[str]:
+        """Преобразует логический путь в физический с нодой"""
+        if not destination or destination.startswith('node:'):
+            return None
+
+        path_parts = [p for p in destination.split('/') if p]
+        if not path_parts:
+            return None
+
+        # 🔥 Ищем конечный актор в пути
+        target_actor = path_parts[-1]
+        target_ref = registry.get_any_replica(target_actor)
+
+        if not target_ref:
+            return None
+
+        target_node = self._find_node_for_actor_ref(target_ref)
+        if not target_node or target_node == self.config.node_id:
+            return None  # Актор локальный или не найден
+
+        # 🔥 Возвращаем полный путь с указанием ноды
+        return f"node:{target_node}/{destination}"
 
     async def _send_create_command(self, node_id: str, actor_name: str, replica_index: int):
         """Отправляет команду создания актора на ноду"""
@@ -843,10 +1052,12 @@ class ClusterActor(Actor):
                 self._orchestration_task = asyncio.create_task(self._orchestrate_all_actors())
 
             elif cluster_changed:
-                log.debug(f"📊 Cluster status changed - "
-                        f"Dead: {dead_nodes_detected}, "
-                        f"Suspect: {suspect_nodes_detected}, "
-                        f"Recovered: {recovered_nodes_detected}")
+                log.debug(
+                    f"📊 Cluster status changed - "
+                    f"Dead: {dead_nodes_detected}, "
+                    f"Suspect: {suspect_nodes_detected}, "
+                    f"Recovered: {recovered_nodes_detected}"
+                )
 
             await asyncio.sleep(2)  # Проверяем каждые 2 секунды
 
@@ -883,7 +1094,10 @@ class ClusterActor(Actor):
 
                 if attempt < max_retries - 1:
                     backoff_delay = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
-                    log.debug(f"🔄 Connection attempt {attempt + 1}/{max_retries} to {host}:{port} failed: {error_type}. Retrying in {backoff_delay}s")
+                    log.debug(
+                        f"🔄 Connection attempt {attempt + 1}/{max_retries} "
+                        f"to {host}:{port} failed: {error_type}. "
+                        f"Retrying in {backoff_delay}s")
                     await asyncio.sleep(backoff_delay)
                 else:
                     log.debug(f"🚫 Node {host}:{port} not available after {max_retries} attempts: {error_type}")
@@ -1108,14 +1322,18 @@ class ClusterActor(Actor):
                     if node_id in self.conn:
                         continue
 
-                    if (node_id in self.members and
-                        self.members[node_id].get("status") == "dead"):
+                    if (
+                        node_id in self.members
+                        and self.members[node_id].get("status") == "dead"
+                    ):
                         continue
 
                     last_attempt = connection_attempts.get(node_id, 0)
-                    if (node_id in self.members and
-                        self.members[node_id].get("status") in ["suspect", "unreachable"] and
-                        current_time - last_attempt < 45):
+                    if (
+                        node_id in self.members
+                        and self.members[node_id].get("status") in ["suspect", "unreachable"]
+                        and current_time - last_attempt < 45
+                    ):
                         continue
 
                     log.debug(f"🔗 Attempting connection to {node_id}")
