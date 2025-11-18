@@ -112,13 +112,18 @@ class ActorRegistry:
         return refs
 
     def get_actors_for_orchestration(self) -> List[ActorDefinition]:
-        """Возвращает акторы для оркестрации CrushMapper"""
-        actors = []
-        for defn in self._definitions.values():
-            # Оркестрируем: dynamic=False И parent != None
-            if defn.dynamic is False and defn.parent is not None:
-                actors.append(defn)
-        return actors
+        """Возвращает акторы для оркестрации CrushMapper в правильном порядке"""
+        # Используем топологическую сортировку чтобы родители создавались перед детьми
+        all_actors = self.get_topologically_sorted_actors()
+
+        # Фильтруем только те акторы, которые нужно оркестрировать
+        actors_to_orchestrate = [
+            defn for defn in all_actors
+            if defn.dynamic is False and defn.parent is not None
+        ]
+
+        log.info(f"🎯 Actors for orchestration (sorted): {[a.name for a in actors_to_orchestrate]}")
+        return actors_to_orchestrate
 
     def _register_replica(self, actor_name: str, node_id: str, actor_ref: ActorRef):
         """Регистрирует реплику актора"""
@@ -212,6 +217,40 @@ class ActorRegistry:
         for template_name, actor_refs in self._actor_instances.items():
             instances[template_name] = [ref.name for ref in actor_refs]
         return instances
+
+    def get_topologically_sorted_actors(self) -> List[ActorDefinition]:
+        """Возвращает акторы в порядке топологической сортировки (родители перед детьми)"""
+        graph = self.get_actor_graph()
+
+        # Алгоритм Кана для топологической сортировки
+        in_degree = {}
+        for parent, children in graph.items():
+            if parent not in in_degree:
+                in_degree[parent] = 0
+            for child in children:
+                in_degree[child] = in_degree.get(child, 0) + 1
+
+        # Очередь вершин с нулевой входящей степенью
+        queue = [node for node, degree in in_degree.items() if degree == 0]
+        result = []
+
+        while queue:
+            node = queue.pop(0)
+            if node is not None:  # Игнорируем корневой None
+                # Находим определение актора
+                defn = self._definitions.get(node) or self._dynamic_definitions.get(node)
+                if defn:
+                    result.append(defn)
+
+            # Уменьшаем входящую степень соседей
+            if node in graph:
+                for child in graph[node]:
+                    in_degree[child] -= 1
+                    if in_degree[child] == 0:
+                        queue.append(child)
+
+        log.info(f"📊 Topologically sorted actors: {[a.name for a in result]}")
+        return result
 
 
 registry = ActorRegistry()

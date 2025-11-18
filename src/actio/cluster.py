@@ -613,7 +613,7 @@ class ClusterActor(Actor):
         await asyncio.sleep(5)
         log.info("🔄 Leader starting orchestration of all static actors...")
 
-        # 🔥 ШАГ 1: Cleanup мертвых реплик (существующая логика)
+        # 🔥 ШАГ 1: Cleanup мертвых реплик
         cleanup_count = 0
         for actor_name in list(registry._actor_replicas.keys()):
             for node_id in list(registry._actor_replicas[actor_name].keys()):
@@ -628,6 +628,7 @@ class ClusterActor(Actor):
         if cleanup_count > 0:
             log.info(f"✅ Cleaned up {cleanup_count} dead replicas")
 
+        # 🔥 ШАГ 2: Получаем акторы в ПРАВИЛЬНОМ ПОРЯДКЕ (родители перед детьми)
         actors_to_orchestrate = registry.get_actors_for_orchestration()
 
         if not actors_to_orchestrate:
@@ -635,11 +636,11 @@ class ClusterActor(Actor):
             self._orchestration_done = True
             return
 
-        log.info(f"🎯 Orchestrating {len(actors_to_orchestrate)} actors: {[a.name for a in actors_to_orchestrate]}")
+        log.info(f"🎯 Orchestrating {len(actors_to_orchestrate)} actors in topological order: {[a.name for a in actors_to_orchestrate]}")
 
         self.crush_mapper.update_nodes(self.members)
 
-        # 🔥 ШАГ 2: УМНОЕ РАСПРЕДЕЛЕНИЕ С УЧЕТОМ PARENT
+        # 🔥 ШАГ 3: УМНОЕ РАСПРЕДЕЛЕНИЕ С УЧЕТОМ PARENT (в правильном порядке!)
         placement = {}
 
         for defn in actors_to_orchestrate:
@@ -653,7 +654,7 @@ class ClusterActor(Actor):
                     placement[node_id] = []
                 placement[node_id].append((defn.name, replica_index))
 
-        # 🔥 ШАГ 3: Рассылаем команды создания
+        # 🔥 ШАГ 4: Рассылаем команды создания (в правильном порядке!)
         commands_sent = 0
         for node_id, actor_assignments in placement.items():
             if (
@@ -667,10 +668,11 @@ class ClusterActor(Actor):
                         success = await self._send_create_command(node_id, actor_name, replica_index)
                         if success:
                             commands_sent += 1
+                            log.info(f"✅ Sent create command for {actor_name} to {node_id}")
                     else:
                         log.debug(f"✅ Replica {actor_name} already exists on alive node {node_id}")
 
-        # 🔥 ШАГ 4: Финальная очистка (существующая логика)
+        # 🔥 ШАГ 5: Финальная очистка
         final_cleanup_count = 0
         for actor_name in [a.name for a in actors_to_orchestrate]:
             current_replicas = registry.get_actor_replicas(actor_name)
@@ -691,7 +693,7 @@ class ClusterActor(Actor):
         if final_cleanup_count > 0:
             log.info(f"✅ Final cleanup: removed {final_cleanup_count} orphaned replicas")
 
-        log.info(f"✅ Leader sent {commands_sent} create commands")
+        log.info(f"✅ Leader sent {commands_sent} create commands in topological order")
         self._orchestration_done = True
 
         log.info("📊 Final replica distribution:")
