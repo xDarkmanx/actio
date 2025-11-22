@@ -29,7 +29,7 @@ class ActorRef:
         return isinstance(other, ActorRef) and self.actor_id == other.actor_id
 
 
-@dataclass
+@dataclass(repr=False, eq=False, frozen=True)
 class ActorDefinition:
     name: str
     cls: type

@@ -207,6 +207,7 @@ class ActorSystem:
         self._actors: Dict[ActorRef, '_ActorContext'] = {}
         self._is_stopped = asyncio.Event()
         self.children: List[ActorRef] = []
+        self._actor_names: Dict[str, ActorRef] = {}
 
     def create(self, actor: Actor, name: Optional[str] = None) -> ActorRef:
         """Создаёт корневой актор."""
@@ -252,7 +253,10 @@ class ActorSystem:
 
         actor_id = str(uuid4().hex)
         actor_ref = ActorRef(actor_id=actor_id, path=path, name=name)
+
+        # 🔥 СОЗДАЕМ КОНТЕКСТ И СОХРАНЯЕМ ЭКЗЕМПЛЯР АКТОРА
         actor_ctx = _ActorContext(self, actor_ref, parent)
+        actor_ctx.actor_instance = actor  # 🔥 КРИТИЧЕСКИ ВАЖНО!
 
         actor_ctx.lifecycle = asyncio.get_event_loop().create_task(
             self._actor_lifecycle_loop(actor, actor_ref, actor_ctx)
@@ -260,6 +264,10 @@ class ActorSystem:
 
         actor._context = actor_ctx
         self._actors[actor_ref] = actor_ctx
+
+        if name in self._actor_names:
+            log.warning(f"ActorSystem: Name '{name}' already exists, overwriting: {self._actor_names[name]} with {actor_ref}")
+        self._actor_names[name] = actor_ref
 
         if parent and parent_ctx:
             parent_ctx.children.append(actor_ref)
@@ -270,7 +278,6 @@ class ActorSystem:
             try:
                 from . import registry
                 registry.register_instance(actor._definition.name, actor_ref)
-
             except ImportError as e:
                 log.error(f"Failed to register dynamic instance: {e}")
 
@@ -348,6 +355,7 @@ class ActorSystem:
                 lifecycle_task.cancel()
 
         self._is_stopped.set()
+        self._actor_names.clear()
 
     async def _actor_lifecycle_loop(self, actor: Actor, actor_ref: ActorRef, actor_ctx: '_ActorContext') -> None:
         """Основной цикл жизни актора."""
@@ -424,6 +432,11 @@ class ActorSystem:
         actor_ctx.is_stopped.set()
         del self._actors[actor_ref]
 
+        try:
+            del self._actor_names[actor_ref.name]
+        except KeyError:
+            pass
+
     @staticmethod
     def _validate_actor_ref(actor: Union[Actor, ActorRef]) -> ActorRef:
         """Проверяет и возвращает ActorRef."""
@@ -434,6 +447,31 @@ class ActorSystem:
             raise ValueError(f'Not an actor: {actor}')
 
         return actor
+
+    def get_actor_ref_by_name(self, name: str) -> Optional[ActorRef]:
+        return self._actor_names.get(name)
+
+    def get_actor_instance(self, actor_ref: ActorRef) -> Optional[Actor]:
+        """Возвращает экземпляр актора по ActorRef - ТОЛЬКО ЛОКАЛЬНЫЕ АКТОРЫ"""
+        # 🔥 ПРОВЕРЯЕМ ЧТО АКТОР ЛОКАЛЬНЫЙ
+        actor_ctx = self._actors.get(actor_ref)
+        if actor_ctx and actor_ctx.actor_instance is not None:
+            return actor_ctx.actor_instance
+
+        # 🔥 НЕ ИЩЕМ ПО ИМЕНИ - если не нашли по ref, значит актор удаленный
+        log.debug(f"🔍 Actor instance not found (likely remote): {actor_ref}")
+        return None
+
+    def get_actor_instance_by_path(self, path: str) -> Optional[Actor]:
+        """Находит экземпляр актора по пути - ТОЛЬКО ЛОКАЛЬНЫЕ АКТОРЫ"""
+        # 🔥 ИЩЕМ ТОЛЬКО ЛОКАЛЬНЫЕ АКТОРЫ
+        for actor_ref, actor_ctx in self._actors.items():
+            if actor_ref.path == path and actor_ctx.actor_instance is not None:
+                return actor_ctx.actor_instance
+
+        # 🔥 НЕ ИЩЕМ УДАЛЕННЫЕ АКТОРЫ - они не должны быть в локальной системе
+        log.debug(f"🔍 Actor instance by path not found (likely remote): {path}")
+        return None
 
 
 class _ActorContext:
@@ -449,3 +487,4 @@ class _ActorContext:
         self.children: List[ActorRef] = []
         self.is_stopped: asyncio.Event = asyncio.Event()
         self.receiving_messages: bool = False
+        self.actor_instance: Optional[Actor] = None
