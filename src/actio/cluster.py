@@ -52,6 +52,24 @@ class CrushMapper:
 
         return max(current_weight, 0.1)
 
+    def map_actors_to_nodes(self, actor_definitions: List[ActorDefinition]) -> Dict[str, List[tuple]]:
+        """Распределяет акторы по нодам: {node_id: [(actor_name, replica_index)]}"""
+        if not self.nodes:
+            return {}
+
+        placement = {}
+
+        for defn in actor_definitions:
+            # Получаем целевые ноды для этого актора
+            target_nodes = self.map_actor(defn.name, defn.replicas)
+
+            for replica_index, node_id in enumerate(target_nodes):
+                if node_id not in placement:
+                    placement[node_id] = []
+                placement[node_id].append((defn.name, replica_index))
+
+        return placement
+
     def map_actor(self, actor_name: str, replicas: Union[int, str] = 1) -> List[str]:
         """Распределяет реплики актора по нодам с учетом текущего состояния"""
         if not self.nodes:
@@ -169,7 +187,44 @@ class CrushMapper:
         selected = random.choice(weighted_nodes)
         random.seed()  # Сбрасываем seed
 
+        log.debug(
+            f"🎲 Weighted selection: {selected} from {available_nodes} "
+            f"(weights: {[self.nodes.get(n, 1.0) for n in available_nodes]})"
+        )
         return selected
+
+    def get_optimal_node_for_actor(self, actor_name: str) -> Optional[str]:
+        """Возвращает оптимальную ноду для нового актора"""
+        if not self.nodes:
+            return None
+
+        available_nodes = list(self.nodes.keys())
+        if not available_nodes:
+            return None
+
+        # Выбираем ноду с максимальным весом (наименее загруженную)
+        best_node = max(available_nodes, key=lambda n: self.nodes.get(n, 1.0))
+        log.debug(
+            f"🏆 Optimal node for {actor_name}: {best_node} "
+            f"(weight: {self.nodes.get(best_node, 1.0)})"
+        )
+        return best_node
+
+    def get_node_load(self, node_id: str) -> float:
+        """Возвращает текущую нагрузку ноды (обратный вес)"""
+        weight = self.nodes.get(node_id, 1.0)
+        return 1.0 / weight if weight > 0 else float('inf')
+
+    def print_node_weights(self):
+        """Логирует текущие веса нод (для отладки)"""
+        if not self.nodes:
+            log.info("📊 No nodes available in CrushMapper")
+            return
+
+        log.info("📊 CrushMapper node weights:")
+        for node_id, weight in sorted(self.nodes.items(), key=lambda x: x[1], reverse=True):
+            load = 1.0 / weight if weight > 0 else float('inf')
+            log.info(f"   {node_id}: weight={weight:.2f}, load={load:.2f}")
 
 
 class ClusterActor(Actor):
