@@ -6,7 +6,6 @@ import asyncio
 import json
 import time
 import random
-import hashlib
 import socket
 
 from typing import Any
@@ -14,7 +13,6 @@ from typing import Dict
 from typing import Set
 from typing import Optional
 from typing import List
-from typing import Union
 
 from .crush import Crush
 from . import Actor
