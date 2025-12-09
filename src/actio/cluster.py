@@ -542,10 +542,17 @@ class ClusterActor(Actor):
 
         if self._is_leader and not was_leader:
             log.info(f"🎯 This node is now the cluster leader: {self.config.node_id}")
-            await self._announce_leadership()
-            if self._orchestration_task:
-                self._orchestration_task.cancel()
-            self._orchestration_task = asyncio.create_task(self._orchestrate_all_actors())
+            if self._has_quorum():
+                await self._announce_leadership()
+                if self._orchestration_task:
+                    self._orchestration_task.cancel()
+                self._orchestration_task = asyncio.create_task(self._orchestrate_all_actors())
+            else:
+                log.warning(
+                    f"⚠️ Elected as leader but NO quorum "
+                    f"({self._get_alive_count()}/{len(self.config.cluster_nodes)}), "
+                    f"waiting for majority"
+                )
         elif was_leader and not self._is_leader:
             log.info(f"❌ This node is no longer the leader: {self.config.node_id}")
             if self._orchestration_task:
@@ -819,17 +826,17 @@ class ClusterActor(Actor):
         parent_ref: ActorRef
     ) -> bool:
         """Отправляет команду создания на удаленную ноду"""
-        connection_id = self._find_connection_for_node(node_id)
-        if not connection_id:
+        conn_id = self._find_connection_for_node(node_id)
+        if not conn_id:
             return False
 
         try:
             await self._send_msg(
-                connection_id,
+                conn_id,
                 {
-                    "type": "replica_command",
+                    "action": "replica_command",
                     "actor_name": actor_def.name,
-                    "action": "create",
+                    "command": "create",
                     "replica_index": replica_index,
                     "parent_ref": {
                         "actor_id": parent_ref.actor_id,
@@ -844,63 +851,124 @@ class ClusterActor(Actor):
             log.error(f"❌ Failed to send remote create command to {node_id}: {e}")
             return False
 
-    async def _wait_for_wave_completion(self, wave_actors, timeout: float = 30.0):
-        """Ждет пока все акторы волны будут созданы и запущены"""
+    async def _wait_for_wave_completion(self, wave_actors, timeout: float = 60.0):
+        """Ждет пока все акторы волны будут созданы И зарегистрированы в реестре"""
         start_time = asyncio.get_event_loop().time()
         remaining_actors = {actor.name for actor in wave_actors}
 
         log.info(f"⏳ Waiting for wave completion: {list(remaining_actors)}")
 
+        for node_id in self.conn:
+            if node_id != self.config.node_id:
+                replica_sync_msg = {
+                    'action': 'replica_sync_request',
+                    'from_leader': self.config.node_id,
+                    'wave_actors': [a.name for a in wave_actors]
+                }
+                await self._send_msg(node_id, replica_sync_msg)
+
+        await asyncio.sleep(1.0)
+
+        iteration = 0
         while remaining_actors and (asyncio.get_event_loop().time() - start_time) < timeout:
+            iteration += 1
             completed_actors = set()
 
             for actor_name in list(remaining_actors):
                 replicas = registry.get_actor_replicas(actor_name)
                 actor_def = next((a for a in wave_actors if a.name == actor_name), None)
 
-                if actor_def:
-                    expected_count = self._get_expected_replica_count(actor_def)
+                if not actor_def:
+                    continue
 
-                    # 🔥 ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: акторы действительно запущены
-                    running_count = 0
-                    for node_id, actor_ref in replicas.items():
-                        # 🔥 ИСПРАВЛЕНИЕ: проверяем только локальные акторы
-                        if node_id == self.config.node_id:
+                expected_count = self._get_expected_replica_count(actor_def)
+                target_nodes = self._get_target_nodes_for_actor(actor_def)
+                received_from_nodes = set(replicas.keys())
+
+                if iteration % 5 == 1:
+                    missing_nodes = [n for n in target_nodes if n not in received_from_nodes]
+                    if missing_nodes:
+                        log.debug(f"⏳ {actor_name}: waiting updates from nodes {missing_nodes}")
+
+                # Проверяем что получили от всех целевых нод
+                received_from_all_targets = all(node_id in received_from_nodes for node_id in target_nodes)
+
+                if not received_from_all_targets:
+                    continue
+
+                all_running = True
+                for node_id in target_nodes:
+                    if node_id == self.config.node_id:
+                        actor_ref = replicas.get(node_id)
+                        if actor_ref:
                             actor_instance = self.system.get_actor_instance(actor_ref)
-                            if (
+                            if not (
                                 actor_instance and
                                 hasattr(actor_instance, '_context') and
                                 actor_instance._context and
                                 actor_instance._context.receiving_messages
                             ):
-                                running_count += 1
-                        else:
-                            # 🔥 ДЛЯ УДАЛЕННЫХ АКТОРОВ считаем что они запущены
-                            running_count += 1
+                                all_running = False
+                                log.debug(f'⏳ {actor_name}: local actor on {node_id} not started')
+                                break
 
-                    # Считаем завершенным если все реплики созданы И запущены
-                    if running_count >= expected_count:
-                        completed_actors.add(actor_name)
-                        log.info(f"✅ Actor {actor_name} fully running: {running_count}/{expected_count}")
+                if all_running and len(replicas) >= expected_count:
+                    completed_actors.add(actor_name)
+                    log.info(f'✅ Actor {actor_name} completed: {len(replicas)}/{expected_count} replicas')
+                    log.info(f'   Replicas on nodes: {list(replicas.keys())}')
 
             remaining_actors -= completed_actors
 
             if remaining_actors:
-                log.debug(f"⏳ Still waiting for: {list(remaining_actors)}")
-                await asyncio.sleep(1.0)
+                # 🔥 ПЕРИОДИЧЕСКИ ПРОСИМ ОБНОВЛЕНИЯ У ОСТАВШИХСЯ НОД
+                if iteration % 3 == 0:  # Каждые 3 итерации (6 секунд)
+                    for actor_name in remaining_actors:
+                        actor_def = next((a for a in wave_actors if a.name == actor_name), None)
+                        if actor_def:
+                            target_nodes = self._get_target_nodes_for_actor(actor_def)
+                            current_replicas = registry.get_actor_replicas(actor_name)
+
+                            for node_id in target_nodes:
+                                if (
+                                    node_id != self.config.node_id
+                                    and node_id not in current_replicas
+                                ):
+                                    conn_id = self._find_connection_for_node(node_id)
+                                    if conn_id:
+                                        log.debug(f'📨 Requesting sync for {actor_name} from {node_id}')
+
+                                        replica_sync_msg = {
+                                            'action': 'replica_sync_request',
+                                            'actor_name': actor_name,
+                                            'from_leader': self.config.node_id,
+                                            'request_id': f'sync_{actor_name}_{node_id}_{iteration}'
+                                        }
+
+                                        await self._send_msg(conn_id, replica_sync_msg)
+
+                log.debug(f'⏳ Still waiting for: {list(remaining_actors)}')
+                await asyncio.sleep(2.0)
             else:
-                log.info("🎯 Wave completed: all actors running")
+                # 🔥 ФИНАЛЬНАЯ ПАУЗА чтобы убедиться что все сообщения обработаны
+                await asyncio.sleep(1.0)
+                log.info('🎯 Wave completed: all actors created and registered')
                 return
 
         if remaining_actors:
-            log.warning(f"⚠️ Timeout waiting for actors: {list(remaining_actors)}")
-            # 🔥 ДОБАВИТЬ ДИАГНОСТИКУ
+            log.warning(f'⚠️ Timeout waiting for actors: {list(remaining_actors)}')
+            # Детальная диагностика
             for actor_name in remaining_actors:
                 replicas = registry.get_actor_replicas(actor_name)
-                log.warning(
-                    f"   {actor_name}: expected"
-                    f" {self._get_expected_replica_count(actor_def)}, got {len(replicas)} replicas"
-                )
+                actor_def = next((a for a in wave_actors if a.name == actor_name), None)
+                if actor_def:
+                    expected_count = self._get_expected_replica_count(actor_def)
+                    target_nodes = self._get_target_nodes_for_actor(actor_def)
+                    missing_nodes = [n for n in target_nodes if n not in replicas]
+                    log.warning(f"   {actor_name}:")
+                    log.warning(f"     Expected on nodes: {target_nodes}")
+                    log.warning(f"     Registered on: {list(replicas.keys())}")
+                    log.warning(f"     Missing from: {missing_nodes}")
+                    log.warning(f"     Current replicas: {len(replicas)}/{expected_count}")
 
     def _get_expected_replica_count(self, actor_def: ActorDefinition) -> int:
         """Возвращает ожидаемое количество реплик"""
@@ -931,44 +999,84 @@ class ClusterActor(Actor):
                 self.members[self.config.node_id].get("actor_count", 0) + 1
             self.crush_mapper.update_nodes(self.members)
 
+    def _has_quorum(self) -> bool:
+        """Проверяет есть ли кворум для принятия решений"""
+        if not self.config:
+            return False
+
+        total_configured = len(self.config.cluster_nodes)
+
+        if total_configured < 2:
+            log.error("Cluster must have at least 2 nodes")
+            return False
+
+        # Считаем живых (включая себя)
+        known_alive = 1  # Я всегда жив
+
+        for member in self.config.cluster_nodes:
+            node_id = member.split(':')[0]
+            if node_id == self.config.node_id:
+                continue
+
+            node = self.members.get(node_id)
+            if node and node.get("status") == "alive":
+                known_alive += 1
+
+        # Для 2 нод: нужны ОБЕ живы
+        if total_configured == 2:
+            return known_alive == 2
+
+        # Для 3+ нод: strict majority
+        return known_alive > total_configured / 2
+
+    def _get_alive_count(self) -> int:
+        """Возвращает количество живых нод (включая себя)"""
+        alive = 1  # Я
+        for member in self.config.cluster_nodes:
+            node_id = member.split(':')[0]
+            if node_id == self.config.node_id:
+                continue
+
+            node = self.members.get(node_id)
+            if node and node.get("status") == "alive":
+                alive += 1
+        return alive
+
     # ==================== ОБРАБОТКА СООБЩЕНИЙ ====================
     async def receive(self, sender: ActorRef, message: Any) -> None:
         """Обрабатывает входящие сообщения"""
         log.info(f"🔍 ClusterActor.receive: {type(message).__name__} from {sender}")
 
-        # Обработка команд создания детей
-        if isinstance(message, dict) and message.get("action") == "create_child":
-            child_actor_name = message["child_actor_name"]
-            replica_index = message.get("replica_index", 0)
-
-            log.info(f"🎯 Received create_child command for {child_actor_name}")
-            await self._create_directly_by_name(child_actor_name, replica_index)
-            return
-
-        # Обработка реплик-команд
-        if isinstance(message, dict) and message.get("type") == "replica_command":
-            await self._process_replica_command(message)
-            return
-
-        # Бродкаст сообщения
-        if isinstance(message, dict) and message.get("action") == "actio_broadcast":
-            for node_id in self.conn:
-                await self._send_msg(node_id, message["payload"])
-            return
-
         if isinstance(message, Terminated):
             log.info(f"{message.actor.name} has stopped")
+
+        action = message.get('action', None)
+        match action:
+            case 'create_child':
+                child_actor_name = message["child_actor_name"]
+                replica_index = message.get("replica_index", 0)
+
+                log.info(f"🎯 Received create_child command for {child_actor_name}")
+                await self._create_directly_by_name(child_actor_name, replica_index)
+                return
+            case 'replica_command':
+                await self._process_replica_command(message)
+                return
+            case 'actio_broadcast':
+                for node_id in self.conn:
+                    await self._send_msg(node_id, message["payload"])
+                return
 
     async def _process_replica_command(self, message: Dict[str, Any]):
         """Обрабатывает команды реплик"""
         actor_name = message["actor_name"]
-        action = message["action"]
+        command = message["command"]
         replica_index = message.get("replica_index", 0)
         parent_ref_data = message.get("parent_ref")
 
-        log.info(f"🔄 Processing replica command: {action} for {actor_name}")
+        log.info(f"🔄 Processing replica command: {command} for {actor_name}")
 
-        if action == "create":
+        if command == "create":
             if parent_ref_data:
                 # Восстанавливаем ActorRef родителя
                 parent_ref = ActorRef(
@@ -1038,33 +1146,33 @@ class ClusterActor(Actor):
         except Exception as e:
             log.error(f"❌ Failed to create {actor_name}: {e}")
 
-    async def _broadcast_replica_update(self, actor_name: str, action: str, actor_ref: ActorRef = None):
+    async def _broadcast_replica_update(self, actor_name: str, command: str, actor_ref: ActorRef = None):
         """Рассылает обновление о реплике и регистрирует локально"""
         if not self._cluster_initialized:
             return
 
         # 🔥 РЕГИСТРИРУЕМ ЛОКАЛЬНО ПЕРЕД рассылкой (с проверкой)
-        if action == "add" and actor_ref:
+        if command == "add" and actor_ref:
             current_replicas = registry.get_actor_replicas(actor_name)
             if self.config.node_id not in current_replicas:
                 registry._register_replica(actor_name, self.config.node_id, actor_ref)
-                log.info(f"📝 Registered replica {actor_name} on node {self.config.node_id}")
+                log.info(f'📝 Registered replica {actor_name} on node {self.config.node_id}')
             else:
-                log.debug(f"🔍 Replica {actor_name} already registered on node {self.config.node_id}")
+                log.debug(f'🔍 Replica {actor_name} already registered on node {self.config.node_id}')
 
         message = {
-            "type": "replica_update",
-            "actor_name": actor_name,
-            "node_id": self.config.node_id,
-            "action": action,
-            "timestamp": time.time()
+            'action': 'replica_update',
+            'actor_name': actor_name,
+            'node_id': self.config.node_id,
+            'command': command,
+            'timestamp': time.time()
         }
 
-        if action == "add" and actor_ref:
-            message["actor_ref"] = {
-                "actor_id": actor_ref.actor_id,
-                "path": actor_ref.path,
-                "name": actor_ref.name
+        if command == 'add' and actor_ref:
+            message['actor_ref'] = {
+                'actor_id': actor_ref.actor_id,
+                'path': actor_ref.path,
+                'name': actor_ref.name
             }
 
         # Рассылаем другим нодам
@@ -1072,11 +1180,10 @@ class ClusterActor(Actor):
             if node_id != self.config.node_id:
                 try:
                     await self._send_msg(node_id, message)
-                    log.debug(f"📤 Broadcasted replica update for {actor_name} to {node_id}")
+                    log.debug(f'📤 Broadcasted replica update for {actor_name} to {node_id}')
                 except Exception as e:
-                    log.error(f"❌ Failed to broadcast to {node_id}: {e}")
+                    log.error(f'❌ Failed to broadcast to {node_id}: {e}')
 
-    # ==================== СЕТЕВЫЕ МЕТОДЫ ====================
     async def _goss_loop(self):
         while True:
             if self.goss_tgt:
@@ -1085,7 +1192,7 @@ class ClusterActor(Actor):
                     await self._send_msg(
                         tgt,
                         {
-                            "type": "gossip",
+                            "action": "gossip",
                             "node_id": self.config.node_id,
                             "members": self.members,
                             "incarnation": self.members[self.config.node_id]["incarnation"],
@@ -1094,9 +1201,11 @@ class ClusterActor(Actor):
             await asyncio.sleep(1)
 
     async def _failure_detect(self):
+        """Failure detection с кворумом"""
         while True:
             now = time.time()
-            cluster_changed = False
+            dead_nodes = []
+            resurrected_nodes = []
 
             for node_id, member in list(self.members.items()):
                 if node_id == self.config.node_id:
@@ -1105,25 +1214,83 @@ class ClusterActor(Actor):
                 old_status = member.get("status", "alive")
 
                 if now - member["last_seen"] > self.config.failure_timeout:
-                    member["status"] = "dead"
+                    new_status = "dead"
                 elif now - member["last_seen"] > self.config.failure_timeout / 2:
-                    member["status"] = "suspect"
+                    new_status = "suspect"
                 elif member["status"] != "alive":
-                    member["status"] = "alive"
+                    new_status = "alive"
+                else:
+                    new_status = "alive"
 
-                if member["status"] != old_status:
-                    cluster_changed = True
-                    log.warning(f"Node {node_id} status changed: {old_status} -> {member['status']}")
+                if new_status != old_status:
+                    member["status"] = new_status
 
-            if cluster_changed:
+                    if new_status == "dead" and old_status != "dead":
+                        dead_nodes.append(node_id)
+                    elif old_status in ["dead", "suspect"] and new_status == "alive":
+                        resurrected_nodes.append(node_id)
+
+            if dead_nodes or resurrected_nodes:
                 self.crush_mapper.update_nodes(self.members)
-                if self._is_leader and self._orchestration_done:
+
+            if (dead_nodes or resurrected_nodes) and self._is_leader:
+                if self._has_quorum():
+                    log.info(f"✅ Quorum present ({self._get_alive_count()}/{len(self.config.cluster_nodes)}), "
+                            f"re-orchestrating after deaths: {dead_nodes}")
                     self._orchestration_done = False
                     if self._orchestration_task:
                         self._orchestration_task.cancel()
                     self._orchestration_task = asyncio.create_task(self._orchestrate_all_actors())
+                else:
+                    log.warning(f"⚠️ NO quorum ({self._get_alive_count()}/{len(self.config.cluster_nodes)}), "
+                            f"waiting for majority after deaths: {dead_nodes}")
+
+            if resurrected_nodes and self._is_leader:
+                asyncio.create_task(self._handle_resurrected_nodes_with_delay(resurrected_nodes))
 
             await asyncio.sleep(2)
+
+    async def _handle_resurrected_nodes_with_delay(self, resurrected_nodes):
+        """Обрабатывает воскрешение нод с задержкой"""
+        await asyncio.sleep(15.0)  # Ждём стабилизации
+
+        if not self._is_leader or not self._has_quorum():
+            return
+
+        # Проверяем стабильность
+        stable_nodes = []
+        for node_id in resurrected_nodes:
+            member = self.members.get(node_id)
+            if member and member.get("status") == "alive":
+                # Проверяем что нода стабильно жива последние 5 секунд
+                if time.time() - member.get("last_seen", 0) < 5.0:
+                    stable_nodes.append(node_id)
+
+        if stable_nodes:
+            log.info(f"🎯 Stable resurrected nodes: {stable_nodes}, restoring actors...")
+            await self._restore_resurrected_nodes(stable_nodes)
+
+    async def _restore_resurrected_nodes(self, node_ids):
+        """Восстанавливаем акторы на воскресших нодах"""
+        for node_id in node_ids:
+            # Для каждого статического актора проверяем должен ли он быть на этой ноде
+            for defn in registry._definitions.values():
+                if defn.parent is None or defn.dynamic:
+                    continue
+
+                current_replicas = registry.get_actor_replicas(defn.name)
+
+                # Определяем где должен быть актор СЕЙЧАС
+                target_nodes = self.crush_mapper.map_actor(defn.name, defn.replicas)
+
+                # Если должен быть на этой ноде, но его там нет
+                if node_id in target_nodes and node_id not in current_replicas:
+                    log.info(f"➕ Restoring {defn.name} on {node_id}")
+
+                    parent_ref = self._find_parent_for_creation(node_id, defn)
+                    if parent_ref:
+                        replica_index = target_nodes.index(node_id) if node_id in target_nodes else 0
+                        await self._send_create_command(node_id, defn, replica_index)
 
     async def _nodes_conn(self):
         for node in self.config.cluster_nodes:
@@ -1171,25 +1338,21 @@ class ClusterActor(Actor):
 
                 asyncio.create_task(self._node_lstn(reader=reader, node_id=node_id))
 
-                await self._send_msg(
-                    node_id,
-                    {
-                        "type": "node_join",
-                        "node_id": self.config.node_id,
-                        "port": self.config.cluster_port,
-                    },
-                )
+                join_msg = {
+                    "action": "node_join",
+                    "node_id": self.config.node_id,
+                    "port": self.config.cluster_port,
+                }
 
+                await self._send_msg(node_id, join_msg)
                 # 🔥 ЗАПРАШИВАЕМ СУЩЕСТВУЮЩИЕ РЕПЛИКИ У НОВОЙ НОДЫ
-                await self._send_msg(
-                    node_id,
-                    {
-                        "type": "replica_sync_request",
-                        "node_id": self.config.node_id
-                    }
-                )
+                replica_sync_msg = {
+                    'action': 'replica_sync_request',
+                    'node_id': self.config.node_id
+                }
+                await self._send_msg(node_id, replica_sync_msg)
 
-                log.info(f"✅ Connected to {node_id}")
+                log.info(f'✅ Connected to {node_id}')
                 return True
 
             except (ConnectionRefusedError, socket.gaierror):
@@ -1198,7 +1361,7 @@ class ClusterActor(Actor):
                 else:
                     break
             except Exception as e:
-                log.debug(f"Connection error: {e}")
+                log.debug(f'Connection error: {e}')
                 break
 
         return False
@@ -1214,10 +1377,22 @@ class ClusterActor(Actor):
 
         except (asyncio.IncompleteReadError, ConnectionError):
             log.info(f"Lost connection to: {node_id}")
-            self.conn.pop(node_id, None)
+            writer = self.conn.pop(node_id, None)
+            if writer:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
         except Exception as e:
             log.error(f"Error listening to {node_id}: {e}")
-            self.conn.pop(node_id, None)
+            writer = self.conn.pop(node_id, None)
+            if writer:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     async def _conn_hdl(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
@@ -1236,10 +1411,22 @@ class ClusterActor(Actor):
 
         except (asyncio.IncompleteReadError, ConnectionError):
             log.info(f"Lost connection to: {node_id}")
-            self.conn.pop(node_id, None)
+            writer = self.conn.pop(node_id, None)
+            if writer:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
         except Exception as e:
             log.error(f"Error listening to {node_id}: {e}")
-            self.conn.pop(node_id, None)
+            writer = self.conn.pop(node_id, None)
+            if writer:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     async def _send_msg(self, node_id: str, message: Dict[str, Any]):
         if node_id in self.conn:
@@ -1254,50 +1441,47 @@ class ClusterActor(Actor):
                 self.conn.pop(node_id, None)
 
     async def _process_cluster_msg(self, sender_node: str, message: Dict[str, Any]):
-        msg_type = message.get("type")
+        action = message.get("action", None)
 
-        if msg_type == "node_join":
-            node_id = message["node_id"]
-            self.goss_tgt.add(node_id)
-            self.members[node_id] = {
-                "status": "alive",
-                "last_seen": time.time(),
-                "incarnation": 0,
-                "address": f"{node_id}:{message['port']}",
-                "resources": {},
-                "actor_count": 1
-            }
-            log.info(f"Node {node_id} joined the cluster")
-            self.crush_mapper.update_nodes(self.members)
-
-            # 🔥 ОТПРАВЛЯЕМ ВСЕ НАШИ РЕПЛИКИ НОВОЙ НОДЕ
-            await self._send_all_replicas_to_node(node_id)
-
-        elif msg_type == "replica_sync_request":
-            # 🔥 ОТВЕЧАЕМ СО ВСЕМИ НАШИМИ РЕПЛИКАМИ
-            await self._send_all_replicas_to_node(sender_node)
-
-        elif msg_type == "replica_update":
-            await self._process_replica_update(message)
-
-        elif msg_type == "replica_command":
-            await self._process_replica_command(message)
-
-        elif msg_type == "leader_announcement":
-            await self._process_leader_announcement(message)
-
-        elif msg_type == "gossip":
-            await self._merge_member(message["members"], message["incarnation"])
-            self.crush_mapper.update_nodes(self.members)
-
-        elif msg_type == "heartbeat":
-            if message["node_id"] in self.members:
-                self.members[message["node_id"]]["last_seen"] = time.time()
-
-        else:
-            if message.get('action') == 'route_message':
+        match action:
+            case 'route_message':
                 self._context.letterbox.put_nowait((self.actor_ref, message))
                 log.debug(f"Injected route_message into letterbox for {self.actor_ref.path}")
+            case 'node_join':
+                node_id = message['node_id']
+                self.goss_tgt.add(node_id)
+                self.members[node_id] = {
+                    'status': 'alive',
+                    'last_seen': time.time(),
+                    'incarnation': 0,
+                    'address': f"{node_id}:{message['port']}",
+                    'resources': {},
+                    'actor_count': 1
+                }
+                log.info(f'Node {node_id} joined the cluster')
+                self.crush_mapper.update_nodes(self.members)
+                await self._send_all_replicas_to_node(node_id)
+                return
+            case 'leader_announcement':
+                await self._process_leader_announcement(message)
+                return
+            case 'gossip':
+                await self._merge_member(message["members"], message["incarnation"])
+                self.crush_mapper.update_nodes(self.members)
+            case 'replica_sync_request':
+                await self._send_all_replicas_to_node(sender_node)
+                return
+            case 'replica_update':
+                await self._process_replica_update(message)
+                return
+            case 'replica_command':
+                await self._process_replica_command(message)
+                return
+            case 'heartbeat':
+                if message["node_id"] in self.members:
+                    self.members[message["node_id"]]["last_seen"] = time.time()
+            case _:
+                return
 
     async def _send_all_replicas_to_node(self, target_node: str):
         """Отправляет все наши реплики указанной ноде"""
@@ -1307,10 +1491,10 @@ class ClusterActor(Actor):
                     await self._send_msg(
                         target_node,
                         {
-                            "type": "replica_update",
+                            "action": "replica_update",
                             "actor_name": actor_name,
                             "node_id": node_id,
-                            "action": "add",
+                            "command": "add",
                             "actor_ref": {
                                 "actor_id": actor_ref.actor_id,
                                 "path": actor_ref.path,
@@ -1325,16 +1509,16 @@ class ClusterActor(Actor):
         """Обрабатывает обновления реплик от других нод"""
         actor_name = message["actor_name"]
         node_id = message["node_id"]
-        action = message["action"]
+        command = message["command"]
 
-        log.info(f"🔄 Processing replica update: {action} for {actor_name} from {node_id}")
+        log.info(f"🔄 Processing replica update: {command} for {actor_name} from {node_id}")
 
         # 🔥 НЕ РЕГИСТРИРУЕМ ЛОКАЛЬНЫЕ РЕПЛИКИ ОТ ДРУГИХ НОД КАК ЛОКАЛЬНЫЕ
         if node_id == self.config.node_id:
             log.debug(f"🔍 Skipping local replica update from ourselves: {actor_name}")
             return
 
-        if action == "add":
+        if command == "add":
             actor_ref_data = message["actor_ref"]
             actor_ref = ActorRef(
                 actor_id=actor_ref_data["actor_id"],
@@ -1342,15 +1526,19 @@ class ClusterActor(Actor):
                 name=actor_ref_data["name"]
             )
 
-            # 🔥 ПРОВЕРЯЕМ что еще не зарегистрирован
+            # 🔥 КРИТИЧЕСКО ВАЖНО: обновляем реестр ДО проверки
             current_replicas = registry.get_actor_replicas(actor_name)
             if node_id not in current_replicas:
                 registry._register_replica(actor_name, node_id, actor_ref)
                 log.info(f"✅ Registered REMOTE replica {actor_name} from node {node_id}")
+
+                # 🔥 ЛОГИРУЕМ ДЛЯ ОТЛАДКИ ВОЛН
+                log.info(f"📝 [WAVE SYNC] {actor_name} now registered from {node_id}. "
+                        f"Total replicas: {list(registry.get_actor_replicas(actor_name).keys())}")
             else:
                 log.debug(f"🔍 Replica {actor_name} from {node_id} already registered")
 
-        elif action == "remove":
+        elif command == "remove":
             if actor_name in registry._actor_replicas and node_id in registry._actor_replicas[actor_name]:
                 del registry._actor_replicas[actor_name][node_id]
                 log.info(f"🗑️ Removed remote replica {actor_name} from node {node_id}")
@@ -1387,7 +1575,7 @@ class ClusterActor(Actor):
                 await self._send_msg(
                     node_id,
                     {
-                        "type": "heartbeat",
+                        "action": "heartbeat",
                         "node_id": self.config.node_id,
                         "timestamp": time.time(),
                     },
@@ -1400,7 +1588,7 @@ class ClusterActor(Actor):
             await self._send_msg(
                 node_id,
                 {
-                    "type": "leader_announcement",
+                    "action": "leader_announcement",
                     "leader_id": self.config.node_id,
                     "timestamp": time.time()
                 }

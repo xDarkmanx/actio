@@ -18,7 +18,7 @@ from .actor import Actor
 from .actor import ActorSystem
 from .cluster import ClusterActor
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __author__ = "Semenets V. Pavel"
 __license__ = "MIT"
 
