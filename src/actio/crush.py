@@ -15,6 +15,7 @@ from . import registry
 
 log = logging.getLogger("actio.cluster")
 
+
 class Crush:
     def __init__(self) -> None:
         self.nodes = {}

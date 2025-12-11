@@ -129,6 +129,11 @@ class ActorRegistry:
         """Регистрирует реплику актора"""
         if actor_name not in self._actor_replicas:
             self._actor_replicas[actor_name] = {}
+
+        if node_id != "local" and "local" in self._actor_replicas[actor_name]:
+            del self._actor_replicas[actor_name]["local"]
+            log.debug(f"🧹 Removed 'local' entry for {actor_name}, replaced with {node_id}")
+
         self._actor_replicas[actor_name][node_id] = actor_ref
         log.info(f"✅ Registered replica {actor_name} on node {node_id}: {actor_ref}")
 

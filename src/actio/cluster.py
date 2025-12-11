@@ -69,13 +69,8 @@ class ClusterActor(Actor):
             return
 
         log.info(f"ClusterActor started for node: {self.config.node_id}")
-
-        # 🔥 РЕГИСТРИРУЕМ СЕБЯ В РЕЕСТРЕ И СИНХРОНИЗИРУЕМ
-        actor_name = self.actor_ref.name.split('-')[0]
-        registry._register_replica(actor_name, self.config.node_id, self.actor_ref)
-
-        # 🔥 НЕМЕДЛЕННАЯ СИНХРОНИЗАЦИЯ РЕПЛИКИ
-        await self._broadcast_replica_update(actor_name, "add", self.actor_ref)
+        registry._register_replica(self.actor_ref.name, self.config.node_id, self.actor_ref)
+        await self._broadcast_replica_update(self.actor_ref.name, "add", self.actor_ref)
 
         # Запускаем кластер
         if not self._cluster_initialized:
@@ -86,13 +81,10 @@ class ClusterActor(Actor):
         if self._cluster_initialized:
             return
 
-        log.warning(f"Starting cluster node: {self.config.node_id}")
-
         self.server = await asyncio.start_server(
             self._conn_hdl, self.config.node_ip, self.config.cluster_port
         )
 
-        log.warning(f"Cluster server started on port {self.config.cluster_port}")
         self.members[self.config.node_id] = {
             "status": "alive",
             "last_seen": time.time(),
@@ -245,7 +237,7 @@ class ClusterActor(Actor):
         return success
 
     async def _cluster_route(self, node_and_path: str, message: Dict[str, Any], sender: ActorRef) -> bool:
-        """Маршрутизация на конкретную ноду в формате node:node_id/path"""
+        """Маршрутизация на конкретную ноду в формата node:node_id/path"""
         try:
             parts = node_and_path.split('/', 1)
             target_node = parts[0]
@@ -306,7 +298,6 @@ class ClusterActor(Actor):
 
         return None
 
-    # ==================== ОРКЕСТРАЦИЯ ====================
     async def _leader_election_loop(self):
         """Цикл выборов лидера"""
         while True:
@@ -322,6 +313,15 @@ class ClusterActor(Actor):
     async def _run_leader_election(self):
         """Выборы лидера - самая маленькая нода становится лидером"""
         if not self.members:
+            return
+
+        if not self._has_quorum():
+            if self._is_leader:
+                self._is_leader = False
+                log.warning(f"⚠️ Lost leadership due to no quorum: {self.config.node_id}")
+                if self._orchestration_task:
+                    self._orchestration_task.cancel()
+                    self._orchestration_task = None
             return
 
         alive_nodes = [
@@ -365,10 +365,7 @@ class ClusterActor(Actor):
         await asyncio.sleep(5)
         log.info("🔄 Leader starting orchestration of all static actors...")
 
-        # 🔥 ПРИНУДИТЕЛЬНАЯ СИНХРОНИЗАЦИЯ РЕПЛИК
         await self._sync_all_replicas()
-
-        # Очистка мертвых реплик
         await self._cleanup_dead_replicas()
 
         # Получаем акторы для оркестрации
@@ -398,8 +395,7 @@ class ClusterActor(Actor):
             commands_sent += wave_commands
 
             # Ждем завершения волны перед следующей
-            if gen_idx < len(generations) - 1:
-                await self._wait_for_wave_completion(gen_actors, timeout=30.0)
+            await self._wait_for_wave_completion(gen_actors, timeout=30.0)
 
         log.info(f"✅ Leader sent {commands_sent} create commands in {len(generations)} waves")
         self._orchestration_done = True
@@ -553,9 +549,18 @@ class ClusterActor(Actor):
     def _find_parent_for_creation(self, node_id: str, actor_def: ActorDefinition) -> Optional[ActorRef]:
         """Находит правильного родителя для создания актора"""
         if not actor_def.parent:
-            # Корневой актор - создается через ActioSystem
-            actio_system_replicas = registry.get_actor_replicas("ActioSystem")
-            return actio_system_replicas.get(node_id)
+            # 🔥 КОРНЕВОЙ АКТОР - ищем СТАТИЧЕСКИЕ акторы с parent=None на указанной ноде
+            for defn in registry._definitions.values():
+                if defn.parent is None:  # Это корневой актор
+                    replicas = registry.get_actor_replicas(defn.name)
+                    parent_ref = replicas.get(node_id)
+                    if parent_ref and parent_ref.name == defn.name:
+                        return parent_ref
+
+            log.warning(f"❌ No root actor found on node {node_id} for creating {actor_def.name}")
+            log.warning(f"   Available root actors: {[d.name for d in registry._definitions.values() if d.parent is None]}")
+            log.warning(f"   Registry replicas: {dict((k, list(v.keys())) for k, v in registry._actor_replicas.items())}")
+            return None
         else:
             # Дочерний актор - создается через своего родителя
             parent_replicas = registry.get_actor_replicas(actor_def.parent)
@@ -583,9 +588,7 @@ class ClusterActor(Actor):
                 if parent_actor:
                     log.info(f"🎯 Creating {actor_def.name} via parent {actor_def.parent}.create()")
                     actor_instance = actor_def.cls()
-
-                    # 🔥 ВОЗВРАЩАЕМ ОРИГИНАЛЬНЫЕ ИМЕНА
-                    ref = parent_actor.create(actor_instance, name=actor_def.name)  # Всегда оригинальное имя!
+                    ref = parent_actor.create(actor_instance, name=actor_def.name)
 
                     if ref:
                         await self._broadcast_replica_update(actor_def.name, "add", ref)
@@ -601,9 +604,7 @@ class ClusterActor(Actor):
         """Создает актор напрямую"""
         try:
             actor_instance = actor_def.cls()
-
-            # 🔥 ВОЗВРАЩАЕМ ОРИГИНАЛЬНЫЕ ИМЕНА
-            ref = self.create(actor_instance, name=actor_def.name)  # Всегда оригинальное имя!
+            ref = self.create(actor_instance, name=actor_def.name)
 
             if ref:
                 await self._broadcast_replica_update(actor_def.name, "add", ref)
@@ -718,8 +719,7 @@ class ClusterActor(Actor):
             remaining_actors -= completed_actors
 
             if remaining_actors:
-                # 🔥 ПЕРИОДИЧЕСКИ ПРОСИМ ОБНОВЛЕНИЯ У ОСТАВШИХСЯ НОД
-                if iteration % 3 == 0:  # Каждые 3 итерации (6 секунд)
+                if iteration % 3 == 0:
                     for actor_name in remaining_actors:
                         actor_def = next((a for a in wave_actors if a.name == actor_name), None)
                         if actor_def:
@@ -747,7 +747,6 @@ class ClusterActor(Actor):
                 log.debug(f'⏳ Still waiting for: {list(remaining_actors)}')
                 await asyncio.sleep(2.0)
             else:
-                # 🔥 ФИНАЛЬНАЯ ПАУЗА чтобы убедиться что все сообщения обработаны
                 await asyncio.sleep(1.0)
                 log.info('🎯 Wave completed: all actors created and registered')
                 return
@@ -788,6 +787,16 @@ class ClusterActor(Actor):
                     cleanup_count += 1
 
         if cleanup_count > 0:
+            if self._is_leader:
+                for node_id in list(self.members.keys()):
+                    if (
+                        node_id != self.config.node_id
+                        and self.members[node_id]['status'] == 'alive'
+                    ):
+                        await self._send_msg(node_id, {
+                            'action': 'cleanup_dead_replicas'
+                        })
+
             log.info(f"🧹 Cleaned up {cleanup_count} dead replicas")
 
     def _update_node_metrics(self):
@@ -840,7 +849,6 @@ class ClusterActor(Actor):
                 alive += 1
         return alive
 
-    # ==================== ОБРАБОТКА СООБЩЕНИЙ ====================
     async def receive(self, sender: ActorRef, message: Any) -> None:
         """Обрабатывает входящие сообщения"""
         log.info(f"🔍 ClusterActor.receive: {type(message).__name__} from {sender}")
@@ -874,30 +882,58 @@ class ClusterActor(Actor):
 
         log.info(f"🔄 Processing replica command: {command} for {actor_name}")
 
-        if command == "create":
-            if parent_ref_data:
-                # Восстанавливаем ActorRef родителя
-                parent_ref = ActorRef(
-                    actor_id=parent_ref_data["actor_id"],
-                    path=parent_ref_data["path"],
-                    name=parent_ref_data["name"]
+        match command:
+            case 'create':
+                if parent_ref_data:
+                    # Восстанавливаем ActorRef родителя
+                    parent_ref = ActorRef(
+                        actor_id=parent_ref_data["actor_id"],
+                        path=parent_ref_data["path"],
+                        name=parent_ref_data["name"]
+                    )
+
+                    # Проверяем, являемся ли мы целевым родителем
+                    if parent_ref == self.actor_ref:
+                        await self._create_directly_by_name(actor_name, replica_index)
+                    else:
+                        log.info(f"🔄 Getting parent instance: {parent_ref}")
+                        parent_actor = self.system.get_actor_instance(parent_ref)
+
+                        if parent_actor:
+                            log.info(f"✅ Found parent instance, creating {actor_name} via parent.create()")
+                            await self._create_via_parent(parent_actor, actor_name, replica_index)
+                        else:
+                            log.error(f"❌ Parent instance not found: {parent_ref}")
+                else:
+                    # Обратная совместимость
+                    await self._create_directly_by_name(actor_name, replica_index)
+                return
+            case 'stop':
+                log.info(f"🛑 Received stop command for {actor_name}")
+                # Получаем actor_ref из сообщения
+                actor_ref_data = message.get("actor_ref")
+                if not actor_ref_data:
+                    log.error(f"❌ No actor_ref in stop command for {actor_name}")
+                    return
+
+                actor_ref = ActorRef(
+                    actor_id=actor_ref_data["actor_id"],
+                    path=actor_ref_data["path"],
+                    name=actor_ref_data["name"]
                 )
 
-                # Проверяем, являемся ли мы целевым родителем
-                if parent_ref == self.actor_ref:
-                    await self._create_directly_by_name(actor_name, replica_index)
+                # Находим актор и останавливаем
+                actor_instance = self.system.get_actor_instance_by_path(actor_ref.path)
+                if actor_instance:
+                    log.info(f"🛑 Stopping actor {actor_ref.path}")
+                    actor_instance.stop()
                 else:
-                    log.info(f"🔄 Getting parent instance: {parent_ref}")
-                    parent_actor = self.system.get_actor_instance(parent_ref)
+                    log.warning(f"⚠️ Actor instance not found for stop: {actor_ref.path}")
 
-                    if parent_actor:
-                        log.info(f"✅ Found parent instance, creating {actor_name} via parent.create()")
-                        await self._create_via_parent(parent_actor, actor_name, replica_index)
-                    else:
-                        log.error(f"❌ Parent instance not found: {parent_ref}")
-            else:
-                # Обратная совместимость
-                await self._create_directly_by_name(actor_name, replica_index)
+                return
+            case _:
+                log.warning(f"⚠️ Unknown replica command: {command} for {actor_name}")
+                return
 
     async def _create_via_parent(self, parent_actor: Actor, actor_name: str, replica_index: int):
         """Создает актор через экземпляр родителя"""
@@ -915,8 +951,6 @@ class ClusterActor(Actor):
 
             # Создаем экземпляр актора
             actor_instance = actor_def.cls()
-
-            # 🔥 СОЗДАЕМ ЧЕРЕЗ РОДИТЕЛЯ
             ref = parent_actor.create(actor_instance, name=actor_name)
 
             if ref:
@@ -949,7 +983,6 @@ class ClusterActor(Actor):
         if not self._cluster_initialized:
             return
 
-        # 🔥 РЕГИСТРИРУЕМ ЛОКАЛЬНО ПЕРЕД рассылкой (с проверкой)
         if command == "add" and actor_ref:
             current_replicas = registry.get_actor_replicas(actor_name)
             if self.config.node_id not in current_replicas:
@@ -1031,28 +1064,50 @@ class ClusterActor(Actor):
             if dead_nodes or resurrected_nodes:
                 self.crush_mapper.update_nodes(self.members)
 
+            if hasattr(self, '_pending_resurrected_nodes') and self._pending_resurrected_nodes:
+                for node_id in list(self._pending_resurrected_nodes):
+                    # Проверяем что нода все еще alive
+                    if node_id in self.members and self.members[node_id].get("status") == "alive":
+                        resurrected_nodes.append(node_id)
+                        log.info(f"🔍 Processing resurrected node from pending list: {node_id}")
+
+                # Очищаем обработанные
+                self._pending_resurrected_nodes.clear()
+
             if (dead_nodes or resurrected_nodes) and self._is_leader:
                 if self._has_quorum():
-                    log.info(f"✅ Quorum present ({self._get_alive_count()}/{len(self.config.cluster_nodes)}), "
-                            f"re-orchestrating after deaths: {dead_nodes}")
+                    log.info(
+                        f"✅ Quorum present ({self._get_alive_count()}/{len(self.config.cluster_nodes)}), "
+                        f"re-orchestrating after deaths: {dead_nodes}"
+                    )
                     self._orchestration_done = False
                     if self._orchestration_task:
                         self._orchestration_task.cancel()
                     self._orchestration_task = asyncio.create_task(self._orchestrate_all_actors())
                 else:
-                    log.warning(f"⚠️ NO quorum ({self._get_alive_count()}/{len(self.config.cluster_nodes)}), "
-                            f"waiting for majority after deaths: {dead_nodes}")
+                    log.warning(
+                        f"⚠️ NO quorum ({self._get_alive_count()}/{len(self.config.cluster_nodes)}), "
+                        f"waiting for majority after deaths: {dead_nodes}"
+                    )
 
+            # ==================== ВОССТАНОВЛЕНИЕ НОД ====================
             if resurrected_nodes and self._is_leader:
+                log.info(f"🔍 Detected resurrected nodes: {resurrected_nodes}")
                 asyncio.create_task(self._handle_resurrected_nodes_with_delay(resurrected_nodes))
 
             await asyncio.sleep(2)
 
     async def _handle_resurrected_nodes_with_delay(self, resurrected_nodes):
         """Обрабатывает воскрешение нод с задержкой"""
-        await asyncio.sleep(15.0)  # Ждём стабилизации
+        log.info(f"⏳ Handle resurrected nodes delay started for: {resurrected_nodes}")
+        await asyncio.sleep(15.0)
 
-        if not self._is_leader or not self._has_quorum():
+        if not self._is_leader:
+            log.debug("⏭️ Skipping restoration - not leader")
+            return
+
+        if not self._has_quorum():
+            log.warning(f"⏭️ Skipping restoration - no quorum ({self._get_alive_count()}/{len(self.config.cluster_nodes)})")
             return
 
         # Проверяем стабильность
@@ -1067,34 +1122,67 @@ class ClusterActor(Actor):
         if stable_nodes:
             log.info(f"🎯 Stable resurrected nodes: {stable_nodes}, restoring actors...")
             await self._restore_resurrected_nodes(stable_nodes)
+        else:
+            log.info("⏭️ No stable nodes for restoration")
 
     async def _restore_resurrected_nodes(self, node_ids):
-        """Восстанавливаем акторы на воскресших нодах"""
+        """Восстанавливаем акторы на воскресших нодах: Остановить все → Очистить → Переоркестрировать"""
+        if not self._is_leader or not self._has_quorum():
+            log.debug('⏭️ Skipping restore_resurrected_nodes - not leader or no quorum')
+            return
+
         for node_id in node_ids:
-            # Для каждого статического актора проверяем должен ли он быть на этой ноде
-            for defn in registry._definitions.values():
-                if defn.parent is None or defn.dynamic:
-                    continue
+            log.info(f"🔄 Leader initiating FULL restore for node {node_id}")
 
-                current_replicas = registry.get_actor_replicas(defn.name)
+            # 1. Остановить все акторы на ноде
+            await self._stop_all_replicas_on_node(node_id)
+            log.info(f"✅ Node {node_id} prepared for re-orchestration")
 
-                # Определяем где должен быть актор СЕЙЧАС
-                target_nodes = self.crush_mapper.map_actor(defn.name, defn.replicas)
+        # 3. Обновить CrushMapper (ноды снова живы)
+        self.crush_mapper.update_nodes(self.members)
 
-                # Если должен быть на этой ноде, но его там нет
-                if node_id in target_nodes and node_id not in current_replicas:
-                    log.info(f"➕ Restoring {defn.name} on {node_id}")
+        # 4. Запустить полную оркестрацию
+        log.info("🎯 Starting full orchestration after node restoration")
+        self._orchestration_done = False
+        if self._orchestration_task:
+            self._orchestration_task.cancel()
+        self._orchestration_task = asyncio.create_task(self._orchestrate_all_actors())
 
-                    parent_ref = self._find_parent_for_creation(node_id, defn)
-                    if parent_ref:
-                        replica_index = target_nodes.index(node_id) if node_id in target_nodes else 0
-                        await self._send_create_command(node_id, defn, replica_index)
+    async def _stop_all_replicas_on_node(self, node_id: str):
+        """Останавливает ВСЕ акторы на указанной ноде (кроме ClusterActor)"""
+        if node_id == self.config.node_id:
+            # Локальная нода
+            log.info("🛑 Stopping ALL local actors (except ClusterActor)")
+
+            # Собираем всех акторов кроме себя
+            actors_to_stop = []
+            for actor_ref in list(self.system._actors.keys()):
+                if actor_ref != self.actor_ref:  # Не останавливаем ClusterActor
+                    actors_to_stop.append(actor_ref)
+
+            # Останавливаем всех
+            for actor_ref in actors_to_stop:
+                log.info(f"🛑 Stopping {actor_ref}")
+                self.system.stop(actor_ref)
+
+            log.info(f"✅ Sent stop commands to {len(actors_to_stop)} local actors")
+        else:
+            # Удаленная нода
+            conn_id = self._find_connection_for_node(node_id)
+            if conn_id:
+                log.info(f"🛑 Sending stop_all command to {node_id}")
+                await self._send_msg(conn_id, {
+                    "action": "stop_all",
+                    "from_leader": self.config.node_id,
+                    "timestamp": time.time()
+                })
+            else:
+                log.warning(f"🚫 No connection to node {node_id} for stop_all")
 
     async def _nodes_conn(self):
-        for node in self.config.cluster_nodes:
-            node_host, node_port = node.split(":")
-            if node_host != self.config.node_id:
-                await self._node_conn(host=node_host, port=int(node_port))
+        for node_name in self.config.cluster_nodes:
+            if node_name != self.config.node_id:
+                await self._node_conn(host=node_name, port=int(self.config.cluster_port))
 
     def _find_node_for_actor_ref(self, actor_ref: ActorRef) -> Optional[str]:
         """Находит ноду для ActorRef"""
@@ -1113,7 +1201,6 @@ class ClusterActor(Actor):
         if not path_parts:
             return None
 
-        # 🔥 Ищем конечный актор в пути
         target_actor = path_parts[-1]
         target_ref = registry.get_any_replica(target_actor)
 
@@ -1124,17 +1211,16 @@ class ClusterActor(Actor):
         if not target_node or target_node == self.config.node_id:
             return None  # Актор локальный или не найден
 
-        # 🔥 Возвращаем полный путь с указанием ноды
         return f"node:{target_node}/{destination}"
 
     async def _node_conn(self, host: str, port: int, max_retries: int = 3) -> bool:
         for attempt in range(max_retries):
             try:
                 reader, writer = await asyncio.open_connection(host, port)
-                node_id = f"{host}:{port}"
-                self.conn[node_id] = writer
+                # node_id = f"{host}:{port}"
+                self.conn[host] = writer
 
-                asyncio.create_task(self._node_lstn(reader=reader, node_id=node_id))
+                asyncio.create_task(self._node_lstn(reader=reader, node_id=host))
 
                 join_msg = {
                     "action": "node_join",
@@ -1142,15 +1228,15 @@ class ClusterActor(Actor):
                     "port": self.config.cluster_port,
                 }
 
-                await self._send_msg(node_id, join_msg)
+                await self._send_msg(host, join_msg)
                 # 🔥 ЗАПРАШИВАЕМ СУЩЕСТВУЮЩИЕ РЕПЛИКИ У НОВОЙ НОДЫ
                 replica_sync_msg = {
                     'action': 'replica_sync_request',
                     'node_id': self.config.node_id
                 }
-                await self._send_msg(node_id, replica_sync_msg)
+                await self._send_msg(host, replica_sync_msg)
 
-                log.info(f'✅ Connected to {node_id}')
+                log.info(f'✅ Connected to {host}')
                 return True
 
             except (ConnectionRefusedError, socket.gaierror):
@@ -1245,20 +1331,9 @@ class ClusterActor(Actor):
             case 'route_message':
                 self._context.letterbox.put_nowait((self.actor_ref, message))
                 log.debug(f"Injected route_message into letterbox for {self.actor_ref.path}")
+                return
             case 'node_join':
-                node_id = message['node_id']
-                self.goss_tgt.add(node_id)
-                self.members[node_id] = {
-                    'status': 'alive',
-                    'last_seen': time.time(),
-                    'incarnation': 0,
-                    'address': f"{node_id}:{message['port']}",
-                    'resources': {},
-                    'actor_count': 1
-                }
-                log.info(f'Node {node_id} joined the cluster')
-                self.crush_mapper.update_nodes(self.members)
-                await self._send_all_replicas_to_node(node_id)
+                await self._handle_node_join(message)
                 return
             case 'leader_announcement':
                 await self._process_leader_announcement(message)
@@ -1266,6 +1341,7 @@ class ClusterActor(Actor):
             case 'gossip':
                 await self._merge_member(message["members"], message["incarnation"])
                 self.crush_mapper.update_nodes(self.members)
+                return
             case 'replica_sync_request':
                 await self._send_all_replicas_to_node(sender_node)
                 return
@@ -1278,8 +1354,72 @@ class ClusterActor(Actor):
             case 'heartbeat':
                 if message["node_id"] in self.members:
                     self.members[message["node_id"]]["last_seen"] = time.time()
+                return
+            case 'cleanup_dead_replicas':
+                await self._cleanup_dead_replicas()
+                return
+            case 'stop_all':
+                await self._handle_stop_all()
+                return
             case _:
                 return
+
+    async def _handle_stop_all(self, message: Dict[str, Any]):
+        """Обрабатывает команду остановки всех акторов на ноде"""
+        log.info(f"🛑 Received stop_all command from leader {message.get('from_leader')}")
+
+        stopped_count = 0
+        for actor_ref in list(self.system._actors.keys()):
+            if actor_ref != self.actor_ref:  # Не останавливаем себя (ClusterActor)
+                log.info(f"🛑 Stopping {actor_ref}")
+                self.system.stop(actor_ref)
+                stopped_count += 1
+
+        log.info(f"✅ Stopped {stopped_count} local actors")
+
+    async def _handle_node_join(self, message: Dict[str, Any]):
+        """Обрабатывает подключение новой ноды или восстановление старой"""
+        node_id = message['node_id']
+        self.goss_tgt.add(node_id)
+
+        # Сохраняем старый статус перед изменением
+        old_status = None
+        old_incarnation = 0
+        if node_id in self.members:
+            old_status = self.members[node_id].get("status")
+            old_incarnation = self.members[node_id].get("incarnation", 0)
+
+        # Увеличиваем incarnation, не сбрасываем
+        new_incarnation = old_incarnation + 1 if node_id in self.members else 0
+
+        # Сохраняем что нода была dead (если была)
+        was_dead_before = (old_status == "dead")
+
+        # Обновляем запись
+        self.members[node_id] = {
+            'status': 'alive',
+            'last_seen': time.time(),
+            'incarnation': new_incarnation,
+            'address': f"{node_id}:{message['port']}",
+            'resources': {},
+            'actor_count': 1
+        }
+
+        log.info(f'Node {node_id} joined the cluster (incarnation: {new_incarnation}, was: {old_status})')
+        if node_id != self.config.node_id and was_dead_before:
+            if not self._find_connection_for_node(node_id):
+                log.info(f"🔌 Establishing connection TO {node_id}")
+                await self._node_conn(node_id, self.config.cluster_port, max_retries=2)
+
+        self.crush_mapper.update_nodes(self.members)
+        await self._send_all_replicas_to_node(node_id)
+
+        # Если нода была dead и мы лидер - запускаем восстановление
+        if was_dead_before and self._is_leader:
+            log.info(f"🎯 Node {node_id} resurrected from dead, scheduling restoration...")
+            if not hasattr(self, '_pending_resurrected_nodes'):
+                self._pending_resurrected_nodes = []
+            self._pending_resurrected_nodes.append(node_id)
 
     async def _send_all_replicas_to_node(self, target_node: str):
         """Отправляет все наши реплики указанной ноде"""
@@ -1309,9 +1449,6 @@ class ClusterActor(Actor):
         node_id = message["node_id"]
         command = message["command"]
 
-        log.info(f"🔄 Processing replica update: {command} for {actor_name} from {node_id}")
-
-        # 🔥 НЕ РЕГИСТРИРУЕМ ЛОКАЛЬНЫЕ РЕПЛИКИ ОТ ДРУГИХ НОД КАК ЛОКАЛЬНЫЕ
         if node_id == self.config.node_id:
             log.debug(f"🔍 Skipping local replica update from ourselves: {actor_name}")
             return
@@ -1324,15 +1461,10 @@ class ClusterActor(Actor):
                 name=actor_ref_data["name"]
             )
 
-            # 🔥 КРИТИЧЕСКО ВАЖНО: обновляем реестр ДО проверки
             current_replicas = registry.get_actor_replicas(actor_name)
             if node_id not in current_replicas:
                 registry._register_replica(actor_name, node_id, actor_ref)
                 log.info(f"✅ Registered REMOTE replica {actor_name} from node {node_id}")
-
-                # 🔥 ЛОГИРУЕМ ДЛЯ ОТЛАДКИ ВОЛН
-                log.info(f"📝 [WAVE SYNC] {actor_name} now registered from {node_id}. "
-                        f"Total replicas: {list(registry.get_actor_replicas(actor_name).keys())}")
             else:
                 log.debug(f"🔍 Replica {actor_name} from {node_id} already registered")
 

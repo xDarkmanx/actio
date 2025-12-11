@@ -27,19 +27,22 @@ class ActioConfig(BaseModel):
     @field_validator('cluster_nodes')
     @classmethod
     def validate_cluster_nodes(cls, v: List[str]) -> List[str]:
-        """ Node format validation """
+        """ Node format validation - минимальная очистка """
+        result = []
         for node in v:
-            if ':' not in node:
-                raise ValueError(f"Node must be in 'host:port' format, got: {node}")
-        return v
+            node = node.strip()
+            if node:
+                result.append(node)
+        return result
 
     @field_validator('node_id')
     @classmethod
     def validate_node_id(cls, v: str) -> str:
         """ Node id validation """
-        if not v or not v.strip():
+        v = v.strip()
+        if not v:
             raise ValueError("node_id cannot be empty")
-        return v.strip()
+        return v
 
     class Config:
         extra = "allow"
