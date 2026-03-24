@@ -29,7 +29,7 @@ classifiers = [
 [tool.poetry.dependencies]
 python = ">=3.12,<4"
 pydantic = "^2.12.5"
-aioredis = "^2.0.1"
+redis = "^7.3.0"
 aio-pika = "^9.6.2"
 
 [tool.poetry.group.lint.dependencies]
@@ -49,7 +49,6 @@ anyio = "^3.7.0"
 [tool.poetry.group.examples.dependencies]
 fastapi = "^0.135.2"
 aio-pika = "^9.6.2"
-aioredis = "^2.0.1"
 redis = "^7.3.0"
 uvicorn = {extras = ["standard"], version = "^0.42.0"}
 betterlogging = "^1.0.0"

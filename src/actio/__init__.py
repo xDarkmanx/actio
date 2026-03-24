@@ -7,12 +7,16 @@ from __future__ import annotations
 from .config import ActioConfig
 from .ref import ActorRef
 from .ref import ActorDefinition
+
 from .messages import PoisonPill
 from .messages import DeadLetter
 from .messages import Terminated
+
 from .registry import LocalRegistry
+from .registry import RedisRegistry
 from .registry import actio
 from .registry import flush_pending_definitions
+
 from .actor import Actor
 from .system import ActorSystem
 
@@ -35,8 +39,9 @@ __all__ = [
 
     # Registry
     'LocalRegistry',
+    'RedisRegistry',
     'actio',
-    'flush_pending_definitions'
+    'flush_pending_definitions',
 
     # Actor
     'Actor',

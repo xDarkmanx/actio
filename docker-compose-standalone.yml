@@ -3,7 +3,7 @@ x-standalone-env: &standalone-env
   REDIS_URI: "redis://rdb:6379"
 
   ACTIO_MODE: "standalone"
-  ACTIO_REGISTRY: "local"
+  ACTIO_REGISTRY: "redis"
 
   JWT_SECRET_KEY: "Z2cNlGobkK9xseIPyyqq6PhT9c6hseaj"
   SECURE_COOKIES: "false"

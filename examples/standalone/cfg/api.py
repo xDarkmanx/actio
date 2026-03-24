@@ -24,6 +24,7 @@ class ApiConfig(BaseSettings):
 
     # Actio Lib Configuration
     ACTIO_MODE: str = Field('standalone', description="Actor Library Mode")
+    ACTIO_NODE_ID: str = Field('api', description="Actor Node ID")
     ACTIO_REGISTRY: str = Field('local', description="Actor Library Registry Type")
 
 try:

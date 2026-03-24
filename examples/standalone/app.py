@@ -25,6 +25,13 @@ async def app_lifespan(app: FastAPI):
         case 'local':
             from actio import LocalRegistry
             registry = LocalRegistry()
+        case 'redis':
+            from actio import RedisRegistry
+            registry = RedisRegistry(
+                node_id=cfg.ACTIO_NODE_ID,
+                redis_url=cfg.REDIS_URI
+            )
+            await registry.connect()
         case _:
             raise ValueError(f"Unknown registry: {cfg.ACTIO_REGISTRY}")
 
