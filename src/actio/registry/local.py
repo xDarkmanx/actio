@@ -190,6 +190,14 @@ class LocalRegistry(RegistryProtocol):
         parent_defn: ActorDefinition
     ) -> Optional[ActorRef]:
         """Recursively create an actor and its static children."""
+        # ✅ НАХОДИМ ACTORREF РОДИТЕЛЯ (если есть)
+        parent_actor_ref = None
+        if parent_defn.parent:
+            parent_actor_ref = system.get_actor_ref_by_name(parent_defn.parent)
+            if not parent_actor_ref:
+                log.error(f"Parent actor '{parent_defn.parent}' not found for '{parent_defn.name}'")
+                return None
+
         # Создаём экземпляр актора
         try:
             actor_instance = parent_defn.cls()
@@ -197,17 +205,21 @@ class LocalRegistry(RegistryProtocol):
             log.error(f"Failed to instantiate {parent_defn.name}: {e}")
             return None
 
-        # Создаём в системе
+        # ✅ СОЗДАЁМ С УКАЗАНИЕМ РОДИТЕЛЯ (используем внутренний _create)
         try:
-            actor_ref = system.create(actor_instance, name=parent_defn.name)
+            actor_ref = system._create(
+                actor=actor_instance,
+                parent=parent_actor_ref,
+                name=parent_defn.name
+            )
             log.info(f"Created actor: {parent_defn.name} on node local")
         except Exception as e:
             log.error(f"Failed to create actor {parent_defn.name}: {e}")
             return None
 
-        # ✅ ВАЖНО: Регистрируем в _actor_replicas (передаём node_id!)
+        # Регистрируем в _actor_replicas
         try:
-            await self.register(parent_defn.name, actor_ref, node_id="local")  # ← Добавили node_id
+            await self.register(parent_defn.name, actor_ref, node_id="local")
         except Exception as e:
             log.warning(f"Failed to register {parent_defn.name} in replicas: {e}")
 

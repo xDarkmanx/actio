@@ -30,7 +30,38 @@ class Scheduler(Actor):
         await self._schedule_parser_tasks()
 
     async def _schedule_parser_tasks(self):
-        pass
+        try:
+            if self.scheduler:
+                test_job = self.scheduler.add_job(
+                    self._as_trigger_test, # Функция для вызова
+                    'cron',                # Тип: cron (для расписания)
+                    minute='*/1',          # Каждую минуту
+                    id='test_job',
+                    name='Test Actor Task'
+                )
+
+                self.scheduled_jobs['as_trigger_test'] = test_job
+        except Exception as e:
+            log.error(f'Error scheduling parser tasks: {e}')
+
+    async def _as_trigger_test(self):
+        """Trigger Test Actor"""
+        try:
+            log.info("Trigger Test Actor")
+
+            self.tell(self.parent, {
+                'action': 'route_message',
+                'data': {
+                    'action': 'get_status'
+                },
+                'source': 'Scheduler',
+                'destination': 'Test'
+            })
+
+            log.info("Sent get_status command to Test Actor")
+
+        except Exception as e:
+            log.error(f'Error triggering Test Actor: {e}')
 
     async def _init_scheduler(self):
         try:

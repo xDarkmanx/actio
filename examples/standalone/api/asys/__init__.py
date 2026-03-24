@@ -4,9 +4,15 @@
 from .ActioSystem import ActioSystem
 
 from .handlers.Scheduler import Scheduler
+from .services.Test import Test
 
 __all__ = [
+    # Root System
     'ActioSystem',
 
-    'Scheduler'
+    # Handlers
+    'Scheduler',
+
+    # Services
+    'Test'
 ]
