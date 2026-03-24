@@ -1,49 +1,44 @@
 # actio/__init__.py
 # -*- coding: utf-8 -*-
+"""Pure Python actor system for concurrent and distributed applications."""
+
+from __future__ import annotations
 
 from .config import ActioConfig
-
 from .ref import ActorRef
 from .ref import ActorDefinition
-
 from .messages import PoisonPill
 from .messages import DeadLetter
 from .messages import Terminated
-
-from .registry import ActorRegistry
-from .registry import registry
+from .registry import LocalRegistry
 from .registry import actio
-
+from .registry import flush_pending_definitions
 from .actor import Actor
-from .actor import ActorSystem
-from .cluster import ClusterActor
+from .system import ActorSystem
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 __author__ = "Semenets V. Pavel"
 __license__ = "MIT"
 
 __all__ = [
-    # from config
+    # Config
     'ActioConfig',
 
-    # from ref.py
+    # Ref
     'ActorRef',
     'ActorDefinition',
 
-    # from messages.py
+    # Messages
     'PoisonPill',
     'DeadLetter',
     'Terminated',
 
-    # from registry.py
-    'ActorRegistry',
-    'registry',
+    # Registry
+    'LocalRegistry',
     'actio',
+    'flush_pending_definitions'
 
-    # from actor.py
+    # Actor
     'Actor',
     'ActorSystem',
-
-    # from cluster.py
-    'ClusterActor'
 ]

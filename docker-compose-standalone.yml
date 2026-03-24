@@ -1,0 +1,44 @@
+x-standalone-env: &standalone-env
+  REDIS_ENABLED: "true"
+  REDIS_URI: "redis://rdb:6379"
+
+  ACTIO_MODE: "standalone"
+  ACTIO_REGISTRY: "local"
+
+  JWT_SECRET_KEY: "Z2cNlGobkK9xseIPyyqq6PhT9c6hseaj"
+  SECURE_COOKIES: "false"
+
+services:
+  rdb:
+    image: redis:alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    networks:
+      - actio
+    restart: always
+
+  api:
+    image: actio-st:latest
+    ports:
+      - "5001:5000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      <<: *standalone-env
+      ACTIO_NODE_ID: "api"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ${PWD}/examples/standalone:/app/api:rw
+      - ${PWD}/src/actio:/app/src/actio:rw
+    command: /bin/bash -c "/env/bin/uvicorn api:app --ws auto --host 0.0.0.0 --port 5000 --reload --log-config ./api/logging.json"
+    networks:
+      - actio
+    depends_on:
+      - rdb
+    restart: always
+
+networks:
+  actio:
+    name: actio
