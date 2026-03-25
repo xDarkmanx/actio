@@ -15,7 +15,11 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+
+from typing import Any
+from typing import Dict
+from typing import List
+from typing import Optional
 
 from redis import asyncio as aioredis
 
@@ -189,15 +193,17 @@ class RedisRegistry(RegistryProtocol):
     # ==========================================================================
 
     async def _msg_listener_loop(self) -> None:
-        """Background task: listen for messages via Pub/Sub."""
+        """Background task: listen for messages from OTHER nodes."""
         if not self.redis:
             return
 
         self.pubsub = self.redis.pubsub()
-        channel_pattern = f"{MSG_CHANNEL}:*"
 
-        await self.pubsub.psubscribe(channel_pattern)
-        log.debug(f"Subscribed to Pub/Sub pattern: {channel_pattern}")
+        # 🎯 Подписываемся ТОЛЬКО на свой inbox
+        channel = f"{NODES_KEY}:{self.node_id}:inbox"
+        await self.pubsub.subscribe(channel)
+
+        log.debug(f"Subscribed to node inbox: {channel}")
 
         try:
             while not self._closed:
@@ -206,51 +212,57 @@ class RedisRegistry(RegistryProtocol):
                     timeout=1.0
                 )
 
-                if message and message["type"] == "pmessage":
-                    await self._handle_pubsub_message(message)
+                if message and message["type"] == "message":
+                    # 🎯 Это сообщение точно для этой ноды — форвардим в ActioSystem
+                    await self._forward_to_root_actor(message)
 
         except asyncio.CancelledError:
             pass
         finally:
             if self.pubsub:
-                await self.pubsub.punsubscribe()
+                await self.pubsub.unsubscribe(channel)
                 await self.pubsub.close()
                 self.pubsub = None
 
-    async def _handle_pubsub_message(self, message: Dict[str, Any]) -> None:
-        """Process incoming Pub/Sub message and deliver to local actor."""
-        try:
-            channel = message["channel"]
-            if isinstance(channel, bytes):
-                channel = channel.decode()
+    async def _forward_to_root_actor(self, message: Dict[str, Any]) -> None:
+        """
+        Forward Pub/Sub message to ActioSystem.
 
-            # Parse message payload
+        CRITICAL: payload["data"] IS the original route_message — forward it directly!
+        """
+        if not self._system:
+            log.warning("No system reference, cannot forward cluster message")
+            return
+
+        root_ref = self._system.get_actor_ref_by_name("ActioSystem")
+        if not root_ref:
+            log.warning("ActioSystem not found, cannot forward cluster message")
+            return
+
+        try:
             data = message["data"]
             if isinstance(data, bytes):
                 data = data.decode()
 
-            payload = json.loads(data)
-            destination = payload.get("destination")
+            # Распаковываем оболочку от send_message()
+            wrapper = json.loads(data)
 
-            if not destination:
-                log.warning(f"Message without destination: {payload}")
-                return
+            # 🎯 payload["data"] IS the original route_message — extract it!
+            original_message = wrapper.get("data", {})
 
-            # Check if this actor exists locally
-            actor_ref = self._actor_refs.get(destination)
-            if actor_ref and self._system:
-                # Deliver to local actor
-                sender_ref = payload.get("sender_ref")
-                message_data = payload.get("data", {})
-                self._system.tell(actor_ref, message_data, sender=sender_ref)
-                log.debug(f"Delivered message to local actor: {destination}")
-            else:
-                log.debug(f"Actor {destination} not found on node {self.node_id} (cross-node or not created)")
+            # Если в original_message есть node: префикс в destination — снимаем его
+            destination = original_message.get("destination", "")
+            if destination.startswith("node:"):
+                _, actor_path = destination.split("/", 1)
+                original_message["destination"] = actor_path
+                log.debug(f"Stripped node prefix: {destination} → {actor_path}")
 
-        except json.JSONDecodeError as e:
-            log.error(f"Failed to parse Pub/Sub message: {e}")
+            # ✅ Форвардим САМО сообщение в ActioSystem
+            log.debug(f"📥 Forwarding to ActioSystem: {original_message.get('action')} → {original_message.get('destination')}")
+            self._system.tell(root_ref, original_message)
+
         except Exception as e:
-            log.error(f"Error handling Pub/Sub message: {e}")
+            log.error(f"Error forwarding cluster message: {e}", exc_info=True)
 
     # ==========================================================================
     # Cluster command listener
@@ -411,26 +423,71 @@ class RedisRegistry(RegistryProtocol):
         system: ActorSystem,
         timeout: float = 10.0
     ) -> None:
-        """Build actor tree for static (non-dynamic) actors."""
+        """Build actor tree for static actors (cluster-aware)."""
         self._system = system
         log.info(f"Building actor tree on node {self.node_id}")
 
-        # Get static actor definitions (dynamic=False)
+        # Get available nodes for placement decisions
+        available_nodes = await self.get_available_nodes()
+        log.debug(f"Available nodes for placement: {available_nodes}")
+
+        # Get static actor definitions
         static_defs = [
             d for d in self._definitions.values()
             if not d.dynamic
         ]
 
-        # Create root actors (parent=None)
+        # Create root actors ONLY if assigned to this node
         for defn in static_defs:
             if defn.parent is None:
-                if await self._should_create_actor(defn.name):
-                    await self._create_actor_recursive(system, defn)
+                # Cluster placement decision
+                if len(available_nodes) > 1:
+                    from ..crush.mapper import should_create_actor_here
 
-        # Wait briefly for actors to start
+                    if should_create_actor_here(
+                        defn.name,
+                        self.node_id,
+                        available_nodes,
+                        replicas=defn.replicas
+                    ):
+                        log.info(f"Creating {defn.name} on node {self.node_id} (CRUSH assigned)")
+                        # 🎯 Передаём available_nodes в рекурсию!
+                        await self._create_actor_recursive(system, defn, available_nodes)
+                    else:
+                        log.debug(f"Skipping {defn.name}: assigned to another node")
+                else:
+                    # Standalone (1 node): create all actors locally
+                    await self._create_actor_recursive(system, defn, available_nodes)
+
         await asyncio.sleep(0.1)
-
         log.info(f"Actor tree built on node {self.node_id}")
+
+    async def _handle_cross_node_message(self, message: Dict[str, Any]) -> None:
+        """Process cross-node message delivered to this node's inbox."""
+        try:
+            data = message["data"]
+            if isinstance(data, bytes):
+                data = data.decode()
+
+            payload = json.loads(data)
+            destination = payload.get("destination")
+
+            if not destination:
+                log.warning(f"Cross-node message without destination: {payload}")
+                return
+
+            # Доставляем локальному актору если он есть
+            actor_ref = self._actor_refs.get(destination)
+            if actor_ref and self._system:
+                sender_ref = payload.get("sender_ref")
+                message_data = payload.get("data", {})
+                self._system.tell(actor_ref, message_data, sender=sender_ref)
+                log.debug(f"✅ Delivered cross-node message to local actor: {destination}")
+            else:
+                log.warning(f"⚠️ Cross-node message for {destination} but actor not found locally")
+
+        except Exception as e:
+            log.error(f"❌ Error handling cross-node message: {e}")
 
     async def _should_create_actor(self, actor_name: str) -> bool:
         """Determine if this node should create the actor.
@@ -443,9 +500,11 @@ class RedisRegistry(RegistryProtocol):
     async def _create_actor_recursive(
         self,
         system: ActorSystem,
-        parent_defn: ActorDefinition
+        parent_defn: ActorDefinition,
+        available_nodes: List[str]  # ← ← ← НОВЫЙ ПАРАМЕТР
     ) -> Optional[ActorRef]:
-        """Recursively create static actors and register them."""
+        """Recursively create static actors with CRUSH placement."""
+
         # Find parent ActorRef if not root
         parent_ref = None
         if parent_defn.parent:
@@ -476,14 +535,29 @@ class RedisRegistry(RegistryProtocol):
         # Register in registry
         await self.register(parent_defn.name, actor_ref, node_id=self.node_id)
 
-        # Find and create static children
+        # 🎯 Найти и создать статических детей (с проверкой CRUSH!)
         child_defs = [
             d for d in self._definitions.values()
             if d.parent == parent_defn.name and not d.dynamic
         ]
 
         for child_defn in child_defs:
-            await self._create_actor_recursive(system, child_defn)
+            # 🎯 ПРОВЕРЯЕМ: должен ли этот ребёнок быть на этой ноде?
+            if len(available_nodes) > 1:
+                # Lazy import
+                from ..crush.mapper import should_create_actor_here
+
+                if not should_create_actor_here(
+                    child_defn.name,
+                    self.node_id,
+                    available_nodes,
+                    replicas=child_defn.replicas
+                ):
+                    log.debug(f"Skipping child {child_defn.name}: assigned to another node")
+                    continue
+
+            # Рекурсивно создаём ребёнка (передаём available_nodes!)
+            await self._create_actor_recursive(system, child_defn, available_nodes)
 
         return actor_ref
 
@@ -493,7 +567,11 @@ class RedisRegistry(RegistryProtocol):
         message: Any,
         sender_ref: Optional[ActorRef] = None
     ) -> bool:
-        """Send message to actor via Pub/Sub (local or cross-node)."""
+        """
+        Send message via Pub/Sub to specific node channel.
+
+        Messages are published to node:{target_node}:inbox — only that node receives.
+        """
         if not self.redis:
             return False
 
@@ -505,11 +583,25 @@ class RedisRegistry(RegistryProtocol):
             "timestamp": str(time.time()),
         }
 
-        # Publish to actor-specific channel
-        channel = f"{MSG_CHANNEL}:{destination}"
+        # 🎯 Определяем целевую ноду из destination (должен иметь node: префикс)
+        target_node = None
+        if destination.startswith("node:"):
+            node_part, _ = destination.split("/", 1)
+            target_node = node_part.replace("node:", "")
+        else:
+            # Нет префикса — ищем в registry (fallback, не должно случаться)
+            actor_nodes = await self.get_actor_nodes(destination)
+            if actor_nodes:
+                target_node = actor_nodes[0]
+            else:
+                log.warning(f"Actor {destination} not found in cluster")
+                return False
+
+        # 🎯 Публикуем в КАНАЛ КОНКРЕТНОЙ НОДЫ
+        channel = f"{NODES_KEY}:{target_node}:inbox"
         await self.redis.publish(channel, json.dumps(payload))
 
-        log.debug(f"Published message to {channel}")
+        log.debug(f"Published to {channel} (destination: {destination})")
         return True
 
     def get_actor_ref_by_name(self, name: str) -> Optional[ActorRef]:
