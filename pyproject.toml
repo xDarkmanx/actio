@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "actio"
-version = "0.1.4"
+version = "0.1.5"
 description = "Pure Python actor system for building concurrent and distributed applications with async/await support for Python 3.11+"
 authors = ["Semenets V. Pavel <p.semenets@gmail.com>"]
 license = "MIT"
@@ -27,7 +27,7 @@ classifiers = [
 ]
 
 [tool.poetry.dependencies]
-python = ">=3.12,<4"
+python = ">=3.11,<4"
 pydantic = "^2.12.5"
 redis = "^7.3.0"
 aio-pika = "^9.6.2"

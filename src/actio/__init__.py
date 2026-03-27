@@ -20,7 +20,7 @@ from .registry import flush_pending_definitions
 from .actor import Actor
 from .system import ActorSystem
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 __author__ = "Semenets V. Pavel"
 __license__ = "MIT"
 
