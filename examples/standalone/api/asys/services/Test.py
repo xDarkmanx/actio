@@ -12,13 +12,14 @@ from actio import actio
 
 log = logging.getLogger('api.asys.services.Test')
 
+
 @actio(name='Test', parent='ActioSystem')
 class Test(Actor):
     def __init__(self):
         super().__init__()
 
     async def started(self):
-        log.info(f"Test Actor started")
+        log.info("Test Actor started")
 
     async def receive(self, sender: ActorRef, message: Dict[str, Any]) -> None:
         action = message.get('action')
@@ -31,4 +32,3 @@ class Test(Actor):
 
     async def stopped(self):
         pass
-

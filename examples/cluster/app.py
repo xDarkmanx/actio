@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import logging
-import asyncio
 
 from fastapi import FastAPI
 
@@ -10,11 +9,10 @@ from contextlib import asynccontextmanager
 
 from actio import ActorSystem
 from actio import flush_pending_definitions
+from cfg.api import config as cfg
 
 from .api.asys import ActioSystem
 _ = ActioSystem
-
-from .cfg.api import config as cfg
 
 log = logging.getLogger('app')
 
@@ -56,6 +54,7 @@ async def app_lifespan(app: FastAPI):
 
     await asys.shutdown()
     log.info('Shutdown Actio Cluster')
+
 
 app = FastAPI(
     title="Actio Cluster Server",

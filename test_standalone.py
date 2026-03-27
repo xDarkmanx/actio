@@ -7,7 +7,6 @@ import logging
 
 from actio import Actor
 from actio import ActorSystem
-from actio import LocalRegistry
 from actio import actio
 from actio import ActorRef
 from actio.registry import flush_pending_definitions

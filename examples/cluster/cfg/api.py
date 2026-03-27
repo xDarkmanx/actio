@@ -3,11 +3,9 @@
 
 from os import path
 
-from typing import Optional
-from typing import List
-
 from pydantic import Field
 from pydantic_settings import BaseSettings
+
 
 class ApiConfig(BaseSettings):
     # Project Dir
@@ -28,8 +26,9 @@ class ApiConfig(BaseSettings):
     ACTIO_NODE_WEIGHT: float = Field(1.0, description="Actor Node Weight")
     ACTIO_REGISTRY: str = Field('local', description="Actor Library Registry Type")
 
+
 try:
-    config = ApiConfig()  # type: ignore
+    config = ApiConfig()
 
 except Exception as e:
     print(f'Configuration error: {e}')

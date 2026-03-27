@@ -322,7 +322,7 @@ class LocalRegistry(RegistryProtocol):
         log.warning("Actor System Tree:")
         print_node(None)
 
-# --- Backward compatibility ---
+
 _default_registry: Optional[LocalRegistry] = None
 
 

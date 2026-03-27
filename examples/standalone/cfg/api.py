@@ -3,11 +3,9 @@
 
 from os import path
 
-from typing import Optional
-from typing import List
-
 from pydantic import Field
 from pydantic_settings import BaseSettings
+
 
 class ApiConfig(BaseSettings):
     # Project Dir
@@ -27,9 +25,9 @@ class ApiConfig(BaseSettings):
     ACTIO_NODE_ID: str = Field('api', description="Actor Node ID")
     ACTIO_REGISTRY: str = Field('local', description="Actor Library Registry Type")
 
-try:
-    config = ApiConfig()  # type: ignore
 
+try:
+    config = ApiConfig()
 except Exception as e:
     print(f'Configuration error: {e}')
     print('Committing suicide...')

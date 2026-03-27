@@ -18,7 +18,7 @@ class Test(Actor):
         super().__init__()
 
     async def started(self):
-        log.info(f"Test Actor started")
+        log.info("Test Actor started")
 
     async def receive(self, sender: ActorRef, message: Dict[str, Any]) -> None:
         action = message.get('action')
@@ -31,4 +31,3 @@ class Test(Actor):
 
     async def stopped(self):
         pass
-

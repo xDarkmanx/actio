@@ -3,17 +3,14 @@
 
 import logging
 
-from typing import Dict
-from typing import Any
-
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.executors.asyncio import AsyncIOExecutor
 
 from actio import Actor
-from actio import ActorRef
 from actio import actio
 
 log = logging.getLogger("api.asys.handlers.Scheduler")
+
 
 @actio(name='Scheduler', parent='ActioSystem', replicas=1)
 class Scheduler(Actor):
@@ -33,9 +30,9 @@ class Scheduler(Actor):
         try:
             if self.scheduler:
                 test_job = self.scheduler.add_job(
-                    self._as_trigger_test, # Функция для вызова
-                    'cron',                # Тип: cron (для расписания)
-                    minute='*/1',          # Каждую минуту
+                    self._as_trigger_test,
+                    'cron',
+                    minute='*/1',
                     id='test_job',
                     name='Test Actor Task'
                 )
