@@ -205,6 +205,25 @@ class RedisRegistry(RegistryProtocol):
         if not self.redis:
             raise RuntimeError("Redis not connected")
 
+        # 1. Remove from global nodes set
+        await self.redis.srem(f"{NODES_KEY}:all", self.node_id)
+
+        # 2. Delete node metadata
+        await self.redis.delete(f"{NODES_KEY}:{self.node_id}")
+
+        # 3. Delete node's actor list
+        await self.redis.delete(f"{NODES_KEY}:{self.node_id}:actors")
+
+        # 4. Clean up acknowledgments
+        await self.redis.delete(f"{CLUSTER_KEY}:ack:{self.node_id}")
+
+        # 5. 🔥 KEY STEP: Remove this node from ALL actor registrations
+        # Scan all actor keys and remove this node_id from each set
+        async for key in self.redis.scan_iter(f"{ACTORS_KEY}:*"):
+            # Skip meta keys (actio:actors:meta:*)
+            if b":meta:" not in key:
+                await self.redis.srem(key, self.node_id)
+
         # Get host/port from environment (for monitoring only)
         host = os.getenv("HOST", "localhost")
         port = os.getenv("PORT", "5000")
@@ -232,7 +251,7 @@ class RedisRegistry(RegistryProtocol):
         """Background task: renew node registration TTL."""
         while not self._closed and self.redis:
             try:
-                await self._register_node()  # Renew TTL
+                await self._renew_node_ttl()
                 await asyncio.sleep(NODE_HEARTBEAT_INTERVAL)
             except asyncio.CancelledError:
                 break
@@ -243,6 +262,18 @@ class RedisRegistry(RegistryProtocol):
     # ==========================================================================
     # Leader election (first come, first served via SETNX)
     # ==========================================================================
+
+    async def _renew_node_ttl(self) -> None:
+        """Renew node registration TTL only (no cleanup).
+
+        Called by heartbeat loop — must NOT touch actor registrations!
+        """
+        if not self.redis:
+            return
+
+        # Just renew the TTL for node metadata
+        await self.redis.expire(f"{NODES_KEY}:{self.node_id}", NODE_TTL)
+        # That's it — no scanning, no SREM, no cleanup!
 
     async def _try_become_leader(self) -> bool:
         """
@@ -536,7 +567,7 @@ class RedisRegistry(RegistryProtocol):
             nodes_with_capacity.append((node_id, available_capacity))
 
         # Use CRUSH mapper with capacity awareness
-        from ..crush.mapper import map_actor_with_capacity
+        from ..crush import map_actor_with_capacity
 
         actual_replicas = min(int(replicas), len(nodes_with_capacity))
         target_nodes = map_actor_with_capacity(
@@ -562,6 +593,10 @@ class RedisRegistry(RegistryProtocol):
         log.info("🎯 Leader waiting for quorum and stabilization...")
         start_time = time.time()
 
+        WARMUP_PERIOD = 5.0
+        log.info(f"⏳ Warm-up: waiting {WARMUP_PERIOD}s for nodes to register...")
+        await asyncio.sleep(WARMUP_PERIOD)
+
         # Wait for quorum
         while time.time() - start_time < QUORUM_TIMEOUT:
             alive_nodes = await self.get_alive_nodes()
@@ -581,8 +616,52 @@ class RedisRegistry(RegistryProtocol):
         log.info(f"⏳ Waiting {STABILIZATION_DELAY}s for topology stabilization...")
         await asyncio.sleep(STABILIZATION_DELAY)
 
+        log.info("🛑 Sending STOP_ALL to all nodes...")
+        await self._send_stop_all_to_all_nodes()
+
         log.info("✅ Leader ready for orchestration")
         await self._orchestrate_all_actors()
+
+    async def _send_stop_all_to_all_nodes(self) -> None:
+        """Send STOP_ALL command to all alive nodes and wait for ACKs."""
+        alive_nodes = await self.get_alive_nodes()
+        wave_id = f"stop_all_{int(time.time())}"
+
+        log.info(f"🛑 Sending STOP_ALL to {len(alive_nodes)} nodes (wave_id: {wave_id})")
+
+        # Send command to all nodes (including self)
+        for node_id in alive_nodes:
+            await self._send_command(node_id, {
+                "action": "STOP_ALL",
+                "wave_id": wave_id
+            })
+
+        # Wait for acknowledgments (timeout: 10s)
+        ack_timeout = 10.0
+        start_time = time.time()
+        received_acks = set()
+
+        while time.time() - start_time < ack_timeout:
+            # Check ACKs in Redis
+            for node_id in alive_nodes:
+                ack_key = f"{CLUSTER_KEY}:ack:{node_id}"
+                ack_data = await self.redis.get(ack_key)
+
+                if ack_data:
+                    ack = json.loads(ack_data) if isinstance(ack_data, str) else json.loads(ack_data.decode())
+                    if ack.get("wave_id") == wave_id and ack.get("status") == "STOPPED":
+                        received_acks.add(node_id)
+
+            if len(received_acks) >= len(alive_nodes):
+                log.info(f"✅ All nodes acknowledged STOP_ALL: {received_acks}")
+                break
+
+            log.debug(f"⏳ Waiting for STOP_ALL ACKs: {len(received_acks)}/{len(alive_nodes)}")
+            await asyncio.sleep(0.5)
+        else:
+            missing = set(alive_nodes) - received_acks
+            log.warning(f"⚠️ STOP_ALL timeout: missing ACKs from {missing}")
+            # Continue anyway - dead nodes will be cleaned up by TTL
 
     def _get_quorum_size(self) -> int:
         """Calculate quorum size based on expected cluster size."""
@@ -594,9 +673,6 @@ class RedisRegistry(RegistryProtocol):
         """Orchestrate all static actors in waves."""
         if not self._is_leader:
             return
-
-        await self._cleanup_stale_registrations()
-        log.info("🎯 Starting cluster orchestration...")
 
         # Reset load tracking for fresh orchestration
         node_weights = await self._load_node_weights()
@@ -830,18 +906,6 @@ class RedisRegistry(RegistryProtocol):
         await self.redis.publish(cmd_channel, json.dumps(command))
         log.debug(f"📤 Sent command to {target_node}: {command.get('action')}")
 
-    async def _send_command_to_all(self, command: Dict[str, Any]) -> None:
-        """
-        Send command to all nodes in cluster.
-
-        Args:
-            command: Command dict with 'action' and other params
-        """
-        nodes = await self.get_available_nodes()
-
-        for node_id in nodes:
-            await self._send_command(node_id, command)
-
     # ==========================================================================
     # Pub/Sub message listener (for cross-node messages)
     # ==========================================================================
@@ -1027,13 +1091,16 @@ class RedisRegistry(RegistryProtocol):
         log.debug(f"Received ack: wave={wave_id}, status={status}, node={node_id}")
 
     async def _handle_stop_all(self, cmd: Dict[str, Any]) -> None:
-        """Handle STOP_ALL command: stop all local actors."""
-        log.info(f"STOP_ALL received on node {self.node_id}")
-
+        """Handle STOP_ALL command: stop all local actors and send ACK."""
         if self._system:
-            await self._system.stop_all_actors()
+            # Stop all actors gracefully
+            await self._system.shutdown(timeout=5.0)
 
-        await self._send_ack("CLEAN")
+        # Send acknowledgment to leader
+        wave_id = cmd.get("wave_id", "stop_all")
+        await self._send_ack("STOPPED", wave_id=wave_id)
+
+        log.info(f"✅ STOP_ALL completed on node {self.node_id}")
 
     async def _handle_rebalance(self, cmd: Dict[str, Any]) -> None:
         """Handle REBALANCE command: rebuild actor tree."""
@@ -1102,14 +1169,21 @@ class RedisRegistry(RegistryProtocol):
         # Store local reference
         self._actor_refs[name] = actor_ref
 
-        if self.redis:
-            # Where does this actor live?
-            await self.redis.sadd(f"{ACTORS_KEY}:{name}", target_node)
+        if not self.redis:
+            log.warning(f"⚠️ Redis not available, skipping registration for {name}")
+            return
 
-            # 🎯 NEW: Which actors are on this node? (for fast lookup on node death)
-            await self.redis.sadd(f"{NODES_KEY}:{target_node}:actors", name)
+        try:
+            key = f"{ACTORS_KEY}:{name}"
 
-            # Store actor metadata
+            # Add to actor->nodes mapping
+            await self.redis.sadd(key, target_node)
+
+            # Add to node->actors mapping
+            node_actors_key = f"{NODES_KEY}:{target_node}:actors"
+            await self.redis.sadd(node_actors_key, name)
+
+            # Store metadata
             meta = {
                 "name": name,
                 "node_id": target_node,
@@ -1117,7 +1191,10 @@ class RedisRegistry(RegistryProtocol):
             }
             await self.redis.hset(f"{ACTORS_KEY}:meta:{name}", mapping=meta)
 
-        log.debug(f"Registered actor {name} on node {target_node}")
+            log.info(f"✅ Registered actor {name} on node {target_node}")
+
+        except Exception as e:
+            log.error(f"❌ Failed to register {name} on {target_node}: {e}", exc_info=True)
 
     async def unregister(self, name: str, node_id: Optional[str] = None) -> None:
         """Unregister an actor instance."""
@@ -1167,7 +1244,7 @@ class RedisRegistry(RegistryProtocol):
             if defn.parent is None:
                 # Cluster placement decision
                 if len(available_nodes) > 1:
-                    from ..crush.mapper import should_create_actor_here
+                    from ..crush import should_create_actor_here
 
                     if should_create_actor_here(
                         defn.name,
@@ -1196,7 +1273,7 @@ class RedisRegistry(RegistryProtocol):
         while self._is_leader and not self._closed and self.redis:
             try:
                 await asyncio.sleep(300)  # 5 minutes
-                await self._cleanup_stale_registrations()
+                # await self._cleanup_stale_registrations()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1291,7 +1368,7 @@ class RedisRegistry(RegistryProtocol):
 
         # 🎯 CRUSH check: should this actor be created on THIS node?
         if len(available_nodes) > 1:
-            from ..crush.mapper import should_create_actor_here
+            from ..crush import should_create_actor_here
 
             if not should_create_actor_here(
                 parent_defn.name,
@@ -1334,7 +1411,7 @@ class RedisRegistry(RegistryProtocol):
         for child_defn in child_defs:
             # 🎯 CHECK: should this child be on this node?
             if len(available_nodes) > 1:
-                from ..crush.mapper import should_create_actor_here
+                from ..crush import should_create_actor_here
 
                 if not should_create_actor_here(
                     child_defn.name,
