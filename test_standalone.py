@@ -68,33 +68,24 @@ class ChildActor(Actor):
 async def main() -> None:
     """Main test function."""
     log.info("🚀 Starting standalone test...")
-
-    # ✅ 1. Получаем default registry (в него декоратор сохранит определения)
     registry = get_default_registry()
 
-    # ✅ 2. Регистрируем все отложенные определения (async!)
     await flush_pending_definitions(registry)
 
-    # ✅ 3. Создаём ActorSystem с тем же registry
     system = ActorSystem(registry=registry)
 
-    # ✅ 4. Строим дерево акторов
     await registry.build_actor_tree(system, timeout=5.0)
-
-    # ✅ 5. Получаем ссылку на корневой актор
     root_ref = system.get_actor_ref_by_name("TestActor")
     if not root_ref:
-        log.error("❌ Failed to get TestActor reference")
+        log.error("Failed to get TestActor reference")
         log.error(f"Available actors: {list(registry._definitions.keys())}")
         return
 
-    log.info(f"✅ Root actor created: {root_ref.path}")
+    log.info(f"Root actor created: {root_ref.path}")
 
-    # ✅ 6. Отправляем тестовые сообщения
     system.tell(root_ref, {"action": "ping"})
     system.tell(root_ref, {"action": "test", "data": "hello"})
 
-    # ✅ 7. Создаём дочерний актор динамически
     root_instance = system.get_actor_instance(root_ref)
     if root_instance:
         child_ref = await root_instance.create(ChildActor(), name="Child-1")
@@ -102,12 +93,9 @@ async def main() -> None:
 
         system.tell(child_ref, {"action": "child_message"})
 
-    # ✅ 8. Ждём обработки сообщений
     await asyncio.sleep(1.0)
 
     registry.print_actor_tree()
-
-    # ✅ 9. Shutdown
     log.info("🛑 Shutting down...")
     await system.shutdown(timeout=5.0)
 
