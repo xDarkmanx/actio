@@ -29,25 +29,36 @@ async def app_lifespan(app: FastAPI):
             from actio import RedisRegistry
             registry = RedisRegistry(
                 node_id=cfg.ACTIO_NODE_ID,
-                redis_url=cfg.REDIS_URI
+                redis_url=cfg.REDIS_URI,
+                node_weight=cfg.ACTIO_NODE_WEIGHT,
             )
-            await registry.connect()
         case _:
             raise ValueError(f"Unknown registry: {cfg.ACTIO_REGISTRY}")
 
     await flush_pending_definitions(registry)
-
     asys = ActorSystem(registry=registry)
-    await registry.build_actor_tree(system=asys, timeout=1.0)
-    registry.print_actor_tree()
+
+    if cfg.ACTIO_REGISTRY == 'redis':
+        await registry.connect(system=asys)
+    else:
+        await registry.connect()
+
+    if cfg.ACTIO_REGISTRY == 'redis' and cfg.ACTIO_MODE == 'cluster':
+        from actio.registry.redis import LEADER_KEY
+        leader = await registry.redis.get(f"{LEADER_KEY}:leader:current")
+        leader_id = leader.decode() if leader else "unknown"
+        log.info(f"⏳ {cfg.ACTIO_MODE} mode: waiting for leader ({leader_id}) to orchestrate")
+    else:
+        log.info("🎯 Standalone mode: building actor tree locally")
+        await registry.build_actor_tree(system=asys, timeout=10.0)
 
     yield
 
     await asys.shutdown()
-    log.info('Shutdown Actio Standalone')
+    log.info('Shutdown Actio Cluster')
 
 app = FastAPI(
-    title="Actio Standalone Server",
+    title="Actio Cluster Server",
     docs_url=None,
     version='0.0.1',
     lifespan=app_lifespan

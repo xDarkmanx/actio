@@ -19,12 +19,12 @@ log = logging.getLogger("actio.registry.decorator")
 # Глобальный список отложенных определений
 _pending_definitions: List[ActorDefinition] = []
 
-
 def actio(
     name: Optional[str] = None,
     parent: Optional[str] = None,
     replicas: Union[int, str] = 1,
     minimal: int = 1,
+    weight: float = 0.01,
     dynamic: bool = False,
     config: Optional[Dict[str, Any]] = None
 ) -> Callable[[Type], Type]:
@@ -44,6 +44,7 @@ def actio(
             parent=parent,
             replicas=replicas,
             minimal=minimal,
+            weight=weight,
             dynamic=dynamic,
             config=config or {}
         )

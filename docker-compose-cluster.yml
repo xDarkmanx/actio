@@ -4,6 +4,7 @@ x-standalone-env: &standalone-env
 
   ACTIO_MODE: "cluster"
   ACTIO_REGISTRY: "redis"
+  ACTIO_NODE_WEIGHT: "1.0"
 
   JWT_SECRET_KEY: "Z2cNlGobkK9xseIPyyqq6PhT9c6hseaj"
   SECURE_COOKIES: "false"
@@ -26,6 +27,7 @@ services:
     environment:
       <<: *standalone-env
       ACTIO_NODE_ID: "api1"
+      ACTIO_NODE_WEIGHT: "1.0"
     build:
       context: .
       dockerfile: Dockerfile
@@ -48,6 +50,7 @@ services:
     environment:
       <<: *standalone-env
       ACTIO_NODE_ID: "api2"
+      ACTIO_NODE_WEIGHT: "1.0"
     volumes:
       - ${PWD}/examples/cluster:/app/api:rw
       - ${PWD}/src/actio:/app/src/actio:rw
@@ -67,6 +70,7 @@ services:
     environment:
       <<: *standalone-env
       ACTIO_NODE_ID: "api3"
+      ACTIO_NODE_WEIGHT: "1.0"
     volumes:
       - ${PWD}/examples/cluster:/app/api:rw
       - ${PWD}/src/actio:/app/src/actio:rw

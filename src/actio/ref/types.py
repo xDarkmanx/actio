@@ -43,5 +43,6 @@ class ActorDefinition:
     parent: Optional[str]
     replicas: Union[int, str] = 1
     minimal: int = 1
+    weight: float = 0.01
     dynamic: bool = False
     config: Dict[str, Any] = field(default_factory=dict)
