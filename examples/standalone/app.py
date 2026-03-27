@@ -10,9 +10,8 @@ from contextlib import asynccontextmanager
 from actio import ActorSystem
 from actio import flush_pending_definitions
 
-from cfg.api import config as cfg
-
-from api.asys import ActioSystem
+from .cfg.api import config as cfg
+from .api.asys import ActioSystem
 _ = ActioSystem
 
 log = logging.getLogger('app')
