@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "actio"
-version = "0.1.5"
+version = "0.1.6"
 description = "Pure Python actor system for building concurrent and distributed applications with async/await support for Python 3.11+"
 authors = ["Semenets V. Pavel <p.semenets@gmail.com>"]
 license = "MIT"
@@ -45,6 +45,11 @@ pytest-asyncio = "^1.2.0"
 pytest-cov = "^4.1.0"
 pytest-mock = "^3.11.0"
 anyio = "^3.7.0"
+
+[tool.poetry.group.doc.dependencies]
+mkdocs = "^1.6.1"
+mkdocs-material = "^9.7.6"
+mkdocstrings = {extras = ["python"], version = "^1.0.3"}
 
 [tool.poetry.group.examples.dependencies]
 fastapi = "^0.135.2"

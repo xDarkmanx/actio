@@ -833,6 +833,10 @@ class RedisRegistry(RegistryProtocol):
             current_gen = []
 
             for defn in list(remaining):
+                if defn.dynamic:
+                    remaining.discard(defn)
+                    continue
+
                 # Root actors or actors whose parents are already placed
                 if not defn.parent:
                     current_gen.append(defn)
